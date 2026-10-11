@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -834,6 +835,117 @@ process.stdout.write(JSON.stringify(names));`
 	const want = `["gl-soon","cn-mid","cn-late","no-expiry","broken"]`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry order=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSExpiryCardGrid 到期卡片是五列栅格 + 左侧危险度色条，不是旧的文本行。
+//
+// 背景：原实现把「最近到期 / 该批积分 / 日均需耗」拼成一句连续文案（"最近到期
+// 2026-10-31（21 天后到期）· 该批 499 积分 · 到期前日均需耗 ≥24"），数字埋在句子
+// 中间，多个账号扫读时必须逐行读完整句才能比大小。改为 CSS 栅格后同类数字成列，
+// 沿列走可直读。本用例钉住这个结构契约，防止回退成文本行：
+//
+//  1. 危险度分级边界（≤3 红 / 4-7 琥珀 / ≥8 绿）——色条类名就是分级结果本身；
+//  2. 错误行与无批次行走 lv-none，且错误文案必须转义；
+//  3. title 属性值内不得出现裸引号（属性闭合才是注入点，转义后 onmouseover=
+//     只是普通文本，不构成事件处理器）；
+//  4. 日均需耗 = ceil(remain / max(1, days))，days=0（今天到期）不得除零；
+//  5. 表头 5 列且出现在数据行之前，行内恰好 5 个栅格列。
+//
+// 日期一律按「本地今天 +N 天」生成：app.js 的 expDaysLeft 用本地时区解析
+// （new Date(dateStr + 'T00:00:00')）并与本地午夜比较，若探针用 toISOString()
+// 生成 UTC 日期串，在 UTC+8 下会整体退一天、让边界用例假失败。
+func TestAppJSExpiryCardGrid(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry card grid test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function expBatches');
+const end = src.indexOf('async function loadExpiry');
+if (start < 0 || end < 0 || end < start) throw new Error('expiry region not found');
+const sinks = {};
+const mk = id => (sinks[id] = { innerHTML: '', textContent: '', hidden: true });
+const ctx = {
+  esc: s => String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#39;'),
+  fmtTok: v => String(Math.round(Number(v) || 0)),
+  $: id => (sinks[id] || mk(id)),
+  Date, Math, Number, String, Map, Array, Object, isNaN, isFinite,
+  lastPackages: null, lastPackagesAt: 0,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.renderExpiry = renderExpiry;', ctx);
+const p2 = x => String(x).padStart(2, '0');
+const localDay = n => {
+  const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() + n);
+  return d.getFullYear() + '-' + p2(d.getMonth() + 1) + '-' + p2(d.getDate());
+};
+const pack = (days, amount) => ({ end_time: localDay(days) + ' 00:00:00', remain: amount });
+const paint = accounts => { ctx.renderExpiry({ accounts: accounts }); return sinks['expList'].innerHTML; };
+const lvOf = html => {
+  const m = html.match(/<div class="exp-row ([^"]*)"/);
+  return m ? m[1] : 'no-row';
+};
+const out = {};
+out.bad3  = lvOf(paint([{ uid: 'a3', nickname: 'n', packages: [pack(3, 300)] }]));
+out.warn4 = lvOf(paint([{ uid: 'a4', nickname: 'n', packages: [pack(4, 300)] }]));
+out.warn7 = lvOf(paint([{ uid: 'a7', nickname: 'n', packages: [pack(7, 300)] }]));
+out.ok8   = lvOf(paint([{ uid: 'a8', nickname: 'n', packages: [pack(8, 300)] }]));
+const errHtml = paint([{ uid: 'ae', nickname: 'n', error: '<img src=x onerror=alert(1)>' }]);
+out.errClass   = /exp-row lv-none/.test(errHtml) && /exp-main err/.test(errHtml);
+out.errEscaped = /&lt;img/.test(errHtml) && !/<img/.test(errHtml);
+const emptyHtml = paint([{ uid: 'an', nickname: 'n', packages: [] }]);
+out.emptyNotice = /exp-row lv-none/.test(emptyHtml) && /7 天内无到期积分/.test(emptyHtml);
+out.noOldDot = !/exp-dot/.test(errHtml + emptyHtml);
+const tHtml = paint([{ uid: 'a" onmouseover="alert(1)', nickname: 'n', packages: [pack(20, 100)] }]);
+const tAttr = (tHtml.match(/title="([^"]*)"/) || [])[1];
+out.titleEscaped = tAttr !== undefined && tAttr.indexOf('"') < 0 && /&quot;/.test(tAttr);
+out.rate10   = /≥10\/天/.test(paint([{ uid: 'ar', nickname: 'n', packages: [pack(10, 100)] }]));
+out.rateCeil = /≥4\/天/.test(paint([{ uid: 'ac', nickname: 'n', packages: [pack(3, 10)] }]));
+const zeroHtml = paint([{ uid: 'az', nickname: 'n', packages: [pack(0, 50)] }]);
+out.zeroSafe = /≥50\/天/.test(zeroHtml) && !/Infinity|NaN/.test(zeroHtml);
+const hHtml = paint([{ uid: 'ah', nickname: 'n', packages: [pack(20, 100)] }]);
+const headBlock = (hHtml.match(/exp-head[\s\S]*?<\/div>/) || [''])[0];
+out.headCols  = (headBlock.match(/<span>/g) || []).length;
+out.headLabels = (headBlock.match(/<span>([^<]*)<\/span>/g) || [])
+  .map(s => s.replace(/<\/?span>/g, '')).join('|');
+out.headFirst = hHtml.indexOf('exp-head') >= 0 && hHtml.indexOf('exp-head') < hHtml.indexOf('exp-row');
+out.rowCols   = (hHtml.match(/class="exp-(nm|when|days|amt|rate)/g) || []).length;
+process.stdout.write(JSON.stringify(out));`
+	f, err := os.CreateTemp(t.TempDir(), "expgrid-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry card grid node test failed: %v\n%s", err, out)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(strings.TrimSpace(string(out))), &got); err != nil {
+		t.Fatalf("decode expiry card grid output: %v\nraw: %s", err, out)
+	}
+	// 逐字段比较而非整串比对：字段顺序变化不该让用例失败，缺失字段要指出。
+	want := map[string]any{
+		"bad3": "lv-bad", "warn4": "lv-warn", "warn7": "lv-warn", "ok8": "lv-ok",
+		"errClass": true, "errEscaped": true, "emptyNotice": true, "noOldDot": true,
+		"titleEscaped": true, "rate10": true, "rateCeil": true, "zeroSafe": true,
+		"headCols": float64(5), "headFirst": true, "rowCols": float64(5),
+		// 列名钉死：第 3 列是**天数**、第 4 列是**积分**。早期把两者叫「剩余 / 该批」，
+		// 「剩余」会被读成"剩余积分"而与第 4 列撞义——这个断言就是防它回退。
+		"headLabels": "账号|最近到期|距到期|该批积分|日均需耗",
+	}
+	for k, w := range want {
+		if got[k] != w {
+			t.Errorf("%s = %v, want %v", k, got[k], w)
+		}
 	}
 }
 

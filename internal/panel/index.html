@@ -179,17 +179,28 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .inline { display: flex; align-items: center; gap: 9px; }
 
 /* ── 统计条（观测区）──────────────────────────────────────────────── */
+/* 信息层级（D-004）：首屏先回答三个问题——池子健康吗 / 积分够吗 / 何时到期。
+   原先 7 个卡片等宽平铺，主次不分，读的时候要自己找重点；改为
+   「2 个主指标（大） + 5 个次要指标（小）」的非对称栅格，视线先落在大数上。 */
 .stats {
-  display: grid; grid-template-columns: repeat(7, 1fr);
+  display: grid; grid-template-columns: 1.35fr 1.35fr 1fr 1fr 1fr 1fr 1fr;
   border: 1px solid var(--line); border-radius: 11px; background: var(--surface);
   overflow: hidden; margin-bottom: 20px; box-shadow: var(--shadow);
 }
+@media (max-width: 1180px) { .stats { grid-template-columns: repeat(4, 1fr); } }
 @media (max-width: 980px) { .stats { grid-template-columns: repeat(3, 1fr); } }
 @media (max-width: 560px) { .stats { grid-template-columns: repeat(2, 1fr); } }
 .stat { padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
 .stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
 .stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; }
 .stat.good .v { color: var(--ok); } .stat.warn .v { color: var(--warn); } .stat.bad .v { color: var(--bad); }
+/* 主指标：更大的数字 + 底色区分，是首屏视线落点 */
+.stat.hero { padding: 16px 19px; background: linear-gradient(180deg, var(--accent-soft), transparent 70%); }
+.stat.hero .v { font-size: 34px; letter-spacing: -.03em; }
+.stat.hero .k { font-size: 12px; color: var(--ink-2); }
+/* 次要指标：压小字号，退到背景层，不抢主指标的视觉权重 */
+.stat.minor .v { font-size: 19px; font-weight: 550; color: var(--ink-2); }
+.stat.minor .k { font-size: 11px; }
 
 /* ── 面板块 ───────────────────────────────────────────────────────── */
 .box { background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
@@ -575,16 +586,41 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
   /* 用量统计条已改用 .kpis（见「用量视图」段），此处不再保留 .stats.compact 变体。 */
 
-  /* 到期提醒卡片（首页）：每账号一行，色点=危险度，正文数字用 mono 对齐。 */
-  .exp-row { display: flex; align-items: flex-start; gap: 10px; padding: 8px 0;
-    font-size: 12.5px; }
+  /* 到期提醒卡片（首页）。
+     原实现是 flex 文本行——数字埋在句子中间（"最近到期 2026-10-31（21 天后到期）·
+     该批 499 积分…"），扫读时要逐行读句子才能比大小。改为栅格：同类数字成列，
+     眼睛沿列走就能直接比较哪个号最急、哪批最大。危险度走左侧色条而非仅色点，
+     色条在扫读时比 9px 圆点更容易被余光捕获。 */
+  .exp-row { display: grid; grid-template-columns: minmax(88px, 1.1fr) minmax(104px, .9fr) 68px minmax(72px, .9fr) minmax(76px, .9fr);
+    gap: 12px; align-items: center; padding: 9px 14px; font-size: 12.5px;
+    border-left: 3px solid transparent; }
   .exp-row + .exp-row { border-top: 1px solid var(--line-soft); }
-  .exp-dot { width: 9px; height: 9px; border-radius: 50%; margin-top: 4px; flex: none; }
-  .exp-nm { font-weight: 600; flex: none; min-width: 9em; }
-  .exp-main { color: var(--ink-2, inherit); }
+  .exp-row.lv-bad  { border-left-color: var(--bad); background: var(--bad-soft); }
+  .exp-row.lv-warn { border-left-color: var(--warn); }
+  .exp-row.lv-ok   { border-left-color: var(--ok); }
+  .exp-row.lv-none { border-left-color: transparent; }
+  .exp-nm { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* 日期右对齐：它是"值"不是"标签"，与右侧天数/数量/日均同侧才能读成一组。
+     左对齐时列间空白会把「2026-10-31」和「21 天」这对同一事实的数据拉开，
+     视线要跨过空白来回跳；右对齐后 值区连成一片，账号名独占左侧。 */
+  .exp-when { font: 12px var(--mono); color: var(--ink-2); font-variant-numeric: tabular-nums; text-align: right; }
+  .exp-when .note { margin-top: 2px; font-size: 11px; color: var(--ink-3); }
+  .exp-days { font: 550 12px var(--mono); text-align: right; font-variant-numeric: tabular-nums; }
+  .exp-days.lv-bad { color: var(--bad); } .exp-days.lv-warn { color: var(--warn); } .exp-days.lv-ok { color: var(--ink-2); }
+  .exp-amt { text-align: right; font: 12px var(--mono); color: var(--ink); font-variant-numeric: tabular-nums; }
+  .exp-rate { text-align: right; font: 12px var(--mono); color: var(--ink-3); font-variant-numeric: tabular-nums; }
+  .exp-main { color: var(--ink-2); grid-column: 2 / -1; }
   .exp-main b { font-family: var(--mono); font-variant-numeric: tabular-nums; }
   .exp-main .note { margin-top: 2px; font-size: 11px; color: var(--ink-3); }
   .exp-main.err { color: var(--bad); }
+  .exp-head { display: grid; grid-template-columns: minmax(88px, 1.1fr) minmax(104px, .9fr) 68px minmax(72px, .9fr) minmax(76px, .9fr);
+    gap: 12px; padding: 7px 14px; font-size: 11px; color: var(--ink-3);
+    border-bottom: 1px solid var(--line-soft); }
+  .exp-head span:nth-child(n+2) { text-align: right; }
+  @media (max-width: 760px) {
+    .exp-row, .exp-head { grid-template-columns: 1fr 68px minmax(72px, .9fr); }
+    .exp-when, .exp-head span:nth-child(2), .exp-rate, .exp-head span:nth-child(5) { display: none; }
+  }
 
 </style>
 </head>
@@ -639,14 +675,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
     <!-- 账号池 -->
     <section class="view" id="view-accounts">
+      <!-- 主次分级（D-004）：前两张是主指标（首屏视线落点），其余退为次要指标。
+           顺序 = 读面板时的问答顺序：健康吗 → 积分够吗 → 异常在哪 → 细项。 -->
       <div class="stats">
-        <div class="stat"><div class="v" id="sTotal">-</div><div class="k">账号总数</div></div>
-        <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
-        <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
-        <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
-        <div class="stat warn"><div class="v" id="sPaused">-</div><div class="k">已暂停选号</div></div>
-        <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
-        <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
+        <div class="stat hero" id="boxHealthy"><div class="v" id="sHealthy">-</div><div class="k">可用账号</div></div>
+        <div class="stat hero"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
+        <div class="stat minor"><div class="v" id="sTotal">-</div><div class="k">账号总数</div></div>
+        <div class="stat minor warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
+        <div class="stat minor warn"><div class="v" id="sPaused">-</div><div class="k">已暂停选号</div></div>
+        <div class="stat minor bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
+        <div class="stat minor"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>
 
       <!-- 卡片默认可见：此前 hidden + 「仅点检查才渲染」形成死锁（按钮藏在隐藏卡片里，

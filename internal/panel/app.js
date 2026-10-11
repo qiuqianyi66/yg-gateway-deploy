@@ -2816,39 +2816,48 @@ function renderExpiry(d) {
   });
   const rows = keyed.map(({ a }) => {
     if (a.error) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ink-3)"></span>' +
+      // 查询失败：整行占满（错误文案可能较长，栅格会挤），左侧中性色条。
+      return '<div class="exp-row lv-none">' +
         '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
         '<span class="exp-main err">查询失败：' + esc(a.error) + '</span></div>';
     }
     const bs = expBatches(a.packages).filter(b => expDaysLeft(b.date, today) >= 0);
     if (!bs.length) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
+      return '<div class="exp-row lv-none">' +
         '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
         '<span class="exp-main">7 天内无到期积分</span></div>';
     }
     const first = bs[0];
     const days = expDaysLeft(first.date, today);
     const daily = Math.ceil(first.remain / Math.max(1, days));
-    const week = bs.filter(b => expDaysLeft(b.date, today) <= 7)
-      .reduce((s, b) => s + b.remain, 0);
     // 危险度：≤3 天红（不抓紧就真没了）、≤7 天琥珀、更远绿。
     // 上游扣包是 FEFO（按失效时刻升序，实测两号口径一致）：这些快过期批次正是
     // 被消耗得最快的，日均需耗给的是「哪怕单靠这个账号的自然流量也能对齐」的参照。
-    const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
-    const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
+    const lv = days <= 3 ? 'lv-bad' : days <= 7 ? 'lv-warn' : 'lv-ok';
+    const dayWord = days === 0 ? '今天' : days === 1 ? '明天' : days + ' 天';
+    // 后续批次仍以 note 形式附在行内（不在栅格里占列，避免多批时列宽失控）。
     const more = bs.length > 4 ? '　等 ' + bs.length + ' 批' : '';
     const rest = bs.slice(1, 4).map(b =>
       '随后 ' + esc(b.date.slice(5)) + ' · ' + fmtTok(b.remain)).join('　') + more;
-    return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
+    return '<div class="exp-row ' + lv + '" title="' + esc(a.uid || '') + '">' +
       '<span class="exp-nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
-      '<span class="exp-main">最近到期 <b>' + esc(first.date) + '</b>（' + dayWord +
-      '）· 该批 <b>' + fmtTok(first.remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
-      fmtTok(daily) + '</b>' +
-      (week > first.remain ? ' · 7 天内合计 ' + fmtTok(week) : '') +
-      (rest ? '<div class="note">' + rest + '</div>' : '') +
-      '</span></div>';
+      '<span class="exp-when">' + esc(first.date) +
+        (rest ? '<div class="note">' + rest + '</div>' : '') + '</span>' +
+      '<span class="exp-days ' + lv + '">' + esc(dayWord) + '</span>' +
+      '<span class="exp-amt">' + fmtTok(first.remain) + '</span>' +
+      '<span class="exp-rate">≥' + fmtTok(daily) + '/天</span>' +
+      '</div>';
   }).join('');
-  $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
+  // 表头只在有数据时出现：空态/全无到期时表头反而占地方。
+  // 表头字符串在本函数内定义，不提取为模块级常量——frontend_test.go 用 indexOf
+  // 按 expBatches 到 loadExpiry 定位代码段喂给 node/vm，提到函数外的常量会落在
+  // 切片之外导致 ReferenceError。（注意：本注释刻意不写出那两个函数的完整声明
+  // 字面量，否则 indexOf 会先命中注释、把切片从函数中间切断。）
+  // 列名用「距到期 / 该批积分」而非「剩余 / 该批」：第 3 列是**天数**、第 4 列是
+  // **积分数**，叫「剩余」会被读成"剩余积分"而与第 4 列撞义。
+  const head = '<div class="exp-head"><span>账号</span><span>最近到期</span>' +
+    '<span>距到期</span><span>该批积分</span><span>日均需耗</span></div>';
+  $('expList').innerHTML = (rows ? head + rows : '') || '<div class="empty">没有账号</div>';
   // 数据新鲜度透明化：走缓存时标注年龄，免得把旧数据误当实时。
   const ageMin = lastPackages ? Math.floor((Date.now() - lastPackagesAt) / 60000) : 0;
   $('expNote').textContent = (lastPackagesAt && ageMin > 0)
@@ -2885,25 +2894,32 @@ function renderExpirySnapshot(d) {
   const rows = keyed.map(({ a, ms }) => {
     const nm = esc(a.nickname || String(a.uid || '').slice(0, 8));
     if (!ms || !a.credits_earliest_remaining) {
-      return '<div class="exp-row"><span class="exp-dot" style="background:var(--ok)"></span>' +
+      return '<div class="exp-row lv-none">' +
         '<span class="exp-nm">' + nm + '</span>' +
         '<span class="exp-main">无近期到期批次</span></div>';
     }
     const days = Math.max(0, Math.ceil((ms - today.getTime()) / 86400000));
     const remain = Number(a.credits_earliest_remaining || 0);
     const daily = Math.ceil(remain / Math.max(1, days));
-    const cls = days <= 3 ? 'var(--bad)' : days <= 7 ? 'var(--warn)' : 'var(--ok)';
-    const dayWord = days === 0 ? '今天到期' : days === 1 ? '明天到期' : days + ' 天后到期';
+    const lv = days <= 3 ? 'lv-bad' : days <= 7 ? 'lv-warn' : 'lv-ok';
+    const dayWord = days === 0 ? '今天' : days === 1 ? '明天' : days + ' 天';
     const when = new Date(ms).toISOString().slice(0, 10);
-    return '<div class="exp-row"><span class="exp-dot" style="background:' + cls + '"></span>' +
+    return '<div class="exp-row ' + lv + '" title="' + esc(String(a.uid || '')) + '">' +
       '<span class="exp-nm">' + nm + '</span>' +
-      '<span class="exp-main">最近到期 <b>' + esc(when) + '</b>（' + dayWord +
-      '）· 该批 <b>' + fmtTok(remain) + '</b> 积分 · 到期前日均需耗 ≥<b>' +
-      fmtTok(daily) + '</b>' +
-      '<div class="note">仅最早一批，点「检查」看全部到期批次</div>' +
-      '</span></div>';
+      '<span class="exp-when">' + esc(when) + '</span>' +
+      '<span class="exp-days ' + lv + '">' + esc(dayWord) + '</span>' +
+      '<span class="exp-amt">' + fmtTok(remain) + '</span>' +
+      '<span class="exp-rate">≥' + fmtTok(daily) + '/天</span>' +
+      '</div>';
   }).join('');
-  $('expList').innerHTML = rows || '<div class="empty">没有账号</div>';
+  // 与 renderExpiry 同款表头：两个数据源切换时列位不跳变。
+  // 同样在函数内定义：测试切的是本快照渲染函数到 loadExpiry 之间的代码，
+  // 与 renderExpiry 那段没有公共前导区，模块级常量无法同时落进两段。
+  // 两处各留一份是这个切片契约下的必然代价。（同上：注释避免写出完整函数声明
+  // 字面量，否则 indexOf 命中的是注释而非函数本身。）
+  const head = '<div class="exp-head"><span>账号</span><span>最近到期</span>' +
+    '<span>距到期</span><span>该批积分</span><span>日均需耗</span></div>';
+  $('expList').innerHTML = (rows ? head + rows : '') || '<div class="empty">没有账号</div>';
   $('expNote').textContent = list.length + ' 个账号 · 快照（来自本地状态，点「检查」拉实时明细）';
   $('expBox').hidden = false;
 }
