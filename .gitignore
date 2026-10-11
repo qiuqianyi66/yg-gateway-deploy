@@ -20,20 +20,28 @@ config.json
 *.tmp
 __pycache__/
 
+# Binary backups（部署前留的旧版二进制，含凭证无关但体积大，不入库）
+bin/
+
 # Backups (contains auth tokens)
 backups/
 
 # IDE
 .idea/
 .vscode/
-LOOP.md
-PLAN.md
-SPEC.md
-docs/
 
-# 设计/计划文档（但 README.md 必须进版本库）
-*.md
-!README.md
+# 个人草稿（根目录 scratch，非工程产物）
+/LOOP.md
+/PLAN.md
+/SPEC.md
+
+# ── 文档与治理：默认跟踪 ─────────────────────────────────────────────────
+# 早期沿用上游的 `*.md` + `docs/` 全忽略策略，副作用是 .harness 规范、docs/prd
+# 需求文档、.harness/changes 变更记录全部无法入库——十阶段流水线的「可追溯」因此
+# 形同虚设（summary.md 里引用的需求编号在版本库里根本不存在）。
+# 现改为默认跟踪 md，只在上面单独排除个人草稿；密钥仍在文件头单独忽略。
+# 如需恢复旧策略，在上面的 IDE 段加回 `docs/` 与 `*.md` 即可。
+# （此规则调整已记入 .harness/changes/panel-spec/summary.md）
 
 # Windows binaries
 /yg-gateway.exe
