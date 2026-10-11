@@ -74,6 +74,23 @@ type Config struct {
 	// 来自 logging.request_client_info（缺省 true）；关闭时 reqlog 事件的来源字段
 	// 保持为空，归档与面板都不出现来源信息。
 	RecordClientInfo bool
+
+	// MaxBodyBytes 入站 /v1/chat/completions 请求体上限（字节）。超限返回 413，
+	// 且读取阶段即被 MaxBytesReader 截断，超大 body 不会整体进内存（DoS 防护）。
+	// 缺省 0 = 不设上限（保留旧行为）；生产建议显式配置（如 64<<20）。
+	MaxBodyBytes int64
+
+	// TrustedProxy 受信任反向代理来源（可选；nil = 不信任任何代理头）。
+	// 非 nil 时，仅当请求来源落在其中（CIDR 或精确 IP）才采信 X-Forwarded-For /
+	// X-Real-IP 作为客户端真实 IP；否则忽略代理头、回落 TCP 对端（防伪造 XFF
+	// 污染上游风控/计费——ProjectDiscovery「Abusing Reverse Proxies」点名的向量）。
+	// 直连部署（前面无反代）保持 nil 即安全。
+	TrustedProxy *TrustedProxyMatcher
+
+	// ReadOnlyRateLimit 只读端点（/v1/models、/status）限流：window 内最多 limit 次。
+	// 缺省 nil = 不限流（保留旧行为）。按来源 IP 计数（未配置受信任代理时回落 TCP
+	// 对端，等价按直连来源计数）。
+	ReadOnlyRateLimit *ReadOnlyRateLimit
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -121,6 +138,9 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// readonlyRL 只读端点限流器（F-003；nil = 不限流）。在 NewHandler 由
+	// cfg.ReadOnlyRateLimit 构建一次，运行期固定。
+	readonlyRL *rateLimiter
 }
 
 // NewHandler 构建 handler。
@@ -138,9 +158,10 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h.readonlyRL = cfg.ReadOnlyRateLimit.build()
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
-	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
-	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
+	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.rateLimited(h.models)))
+	h.mux.HandleFunc("GET /status", h.withAuth(h.rateLimited(h.status)))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
@@ -152,7 +173,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.RequestLog != nil && r.Method == http.MethodPost && r.URL.Path == "/v1/chat/completions" {
 		trace := &requestTrace{id: reqlog.NewRequestID(), start: time.Now()}
 		if h.loadLive().RecordClientInfo {
-			trace.captureClientInfo(r)
+			trace.captureClientInfo(r, h.cfg.TrustedProxy)
 		}
 		r = r.WithContext(context.WithValue(r.Context(), requestTraceKey{}, trace))
 		obs := &responseObserver{ResponseWriter: w}
@@ -175,6 +196,27 @@ func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+			return
+		}
+		next(w, r)
+	}
+}
+
+// rateLimited 只读端点限流中间件（F-003）。readonlyRL 为 nil 时透传（不限流）。
+// 计数键 = extractClientIP 的客户端 IP（未配置受信任代理时即 TCP 对端）；取不到
+// IP 时退化为全局单一计数（仍防无脑刷，只是粒度变粗）。
+// 注意：与 withAuth 的包裹顺序——鉴权在前，限流在后，避免未鉴权者消耗限流配额。
+func (h *Handler) rateLimited(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if h.readonlyRL == nil {
+			next(w, r)
+			return
+		}
+		key := extractClientIP(h.cfg.TrustedProxy, r)
+		if !h.readonlyRL.allow(key) {
+			w.Header().Set("Retry-After", "1")
+			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limited",
+				"too many requests; retry shortly")
 			return
 		}
 		next(w, r)
@@ -510,15 +552,30 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
-	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
-	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
-	clientIP := upstream.ExtractClientIP(r)
-	// 请求体无大小上限（max_body_mb 已移除，对齐上游）：完整读入，超限类问题交由
-	// 上游自然返回错误（其响应经既有错误分类链路透出，信息量更大）。#41 的截断
-	// 防御语义保留在读错误路径——移除预拦截后，截断只可能来自客户端自己断流，
-	// 读 body 出错就地 400，不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
-	body, err := io.ReadAll(r.Body)
+	// 客户端 IP 提取（F-002：按受信任代理判定；未配置受信任代理时不采信伪造的
+	// X-Forwarded-For，回落 TCP 对端）。透传与否由 upstream.PassthroughIP 决定，
+	// 但这里先保证「采信」这件事是安全的。
+	clientIP := extractClientIP(h.cfg.TrustedProxy, r)
+	// 入站请求体上限（F-001）：MaxBodyBytes > 0 时用 MaxBytesReader 截断，超大
+	// body 不会整体读进内存（否则 io.ReadAll 会把几 GB 的 body 一次性吞下——DoS）。
+	// 超限时 ReadAll 返回 *http.MaxBytesError，就地 413（语义精确，客户端可据此调整）。
+	// 缺省 0 = 不设上限（保留旧行为）。#41 的截断防御语义保留在读错误路径：
+	// 移除预拦截后，截断只可能来自客户端自己断流或 MaxBytesReader，读 body 出错
+	// 就地 4xx，不把半截 JSON 喂上游 unmarshal 报 unexpected EOF 冤枉罚号。
+	var body []byte
+	var err error
+	if h.cfg.MaxBodyBytes > 0 {
+		body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, h.cfg.MaxBodyBytes))
+	} else {
+		body, err = io.ReadAll(r.Body)
+	}
 	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeOpenAIError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+				fmt.Sprintf("request body exceeds %d bytes", mbe.Limit))
+			return
+		}
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "read body: "+err.Error())
 		return
 	}

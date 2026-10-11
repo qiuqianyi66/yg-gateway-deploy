@@ -51,7 +51,29 @@ type Config struct {
 		// 400 "read body: ... i/o timeout"。缺省 "300s"；"0" = 不限制
 		//（慢速 body 可无限占用连接，自担风险）；改动需重启进程。
 		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
+		// MaxBodyBytes /v1/chat/completions 入站请求体字节上限（F-001）。
+		// 超限返回 413，读取阶段即被 MaxBytesReader 截断（超大 body 不整体进内存）。
+		// 0 = 不设上限（旧行为）；生产建议 64MB（64<<20）。改动需重启进程。
+		MaxBodyBytes int64 `json:"max_body_bytes"`
 	} `json:"server"`
+
+	Security struct {
+		// TrustedProxy 受信任反向代理来源（F-002）：逗号分隔的 IP 或 CIDR
+		//（如 "127.0.0.1,10.0.0.0/8,::1"）。空 = 不信任任何代理头。
+		//
+		// 语义：仅当请求来源落在该集合内，才采信 X-Forwarded-For / X-Real-IP
+		// 作为客户端真实 IP（用于日志 + 透传上游）；否则忽略代理头、回落 TCP 对端。
+		// 这是防「伪造 XFF 污染上游风控/计费」的安全默认（ProjectDiscovery
+		// 「Abusing Reverse Proxies」向量）。直连部署保持空；套反代时填反代地址段。
+		// 改动需重启进程。
+		TrustedProxy string `json:"trusted_proxy"`
+		// ReadOnlyRateLimit 只读端点（/v1/models、/status）限流：window 内最多 limit 次，
+		// 按来源 IP 计数，超阈返回 429。limit<=0 或 window<=0 = 不限流（旧行为）。
+		ReadOnlyRateLimit struct {
+			Limit  int    `json:"limit"`  // 窗口内最大请求数；0 = 不限流
+			Window string `json:"window"` // "1m" 等 duration；空/非法 = 不限流
+		} `json:"read_only_rate_limit"`
+	} `json:"security"`
 
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
@@ -228,6 +250,8 @@ type Config struct {
 	CostExploreIntervalDur time.Duration `json:"-"`
 	// ServerReadTimeoutDur 解析后的入站请求读取上限（issue #100）；0 = 不限制。
 	ServerReadTimeoutDur time.Duration `json:"-"`
+	// ReadOnlyRateLimitWindow 解析后的只读端点限流窗口（F-003）；0 = 不限流。
+	ReadOnlyRateLimitWindow time.Duration `json:"-"`
 }
 
 // Default 默认配置。
@@ -472,6 +496,20 @@ func (c *Config) normalize() error {
 	}
 	if c.ServerReadTimeoutDur < 0 {
 		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
+	}
+	// 只读端点限流窗口（F-003）：limit<=0 或 window 空/非法 = 不限流（旧行为）。
+	// window 合法但 limit<=0 时静默不限流（配置了窗口但没给额度 = 用户想关限流）；
+	// window 非法且 limit>0 时报错（给了额度但窗口写错 = 用户想限流但配错了）。
+	if c.Security.ReadOnlyRateLimit.Limit > 0 {
+		if c.Security.ReadOnlyRateLimit.Window == "" {
+			return fmt.Errorf("security.read_only_rate_limit.window: 给定了 limit 但 window 为空")
+		}
+		if c.ReadOnlyRateLimitWindow, err = time.ParseDuration(c.Security.ReadOnlyRateLimit.Window); err != nil {
+			return fmt.Errorf("security.read_only_rate_limit.window: %w", err)
+		}
+		if c.ReadOnlyRateLimitWindow <= 0 {
+			return fmt.Errorf("security.read_only_rate_limit.window: 非正时长 %q 无意义", c.Security.ReadOnlyRateLimit.Window)
+		}
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)

@@ -315,6 +315,18 @@ func main() {
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
+		// 入站边界加固（F-001/F-002/F-003）：装配期固定，改动需重启。
+		MaxBodyBytes: cfg.Server.MaxBodyBytes,
+		TrustedProxy: server.NewTrustedProxyMatcher(cfg.Security.TrustedProxy),
+		ReadOnlyRateLimit: func() *server.ReadOnlyRateLimit {
+			if cfg.Security.ReadOnlyRateLimit.Limit <= 0 || cfg.ReadOnlyRateLimitWindow <= 0 {
+				return nil
+			}
+			return &server.ReadOnlyRateLimit{
+				Limit:  cfg.Security.ReadOnlyRateLimit.Limit,
+				Window: cfg.ReadOnlyRateLimitWindow,
+			}
+		}(),
 	})
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -538,7 +550,10 @@ func restartRequiredFields(c *Config) []string {
 	}
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
-	out = append(out, "server.read_timeout")
+	out = append(out, "server.read_timeout", "server.max_body_bytes")
+	// 入站边界加固字段在装配期被固化进 handler（body 上限 / 受信任代理匹配器 /
+	// 限流器实例），无法热改。
+	out = append(out, "security.trusted_proxy", "security.read_only_rate_limit")
 	return out
 }
 

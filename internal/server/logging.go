@@ -352,20 +352,21 @@ type requestTrace struct {
 
 // captureClientInfo 采集调用来源（客户端 IP + 截断后的 UA）。开关关闭时保持空串：
 // 来源信息比 token 计数敏感，是否落盘由 logging.request_client_info 决定。
-func (t *requestTrace) captureClientInfo(r *http.Request) {
+// proxy 为受信任代理判定（F-002）：nil = 不采信伪造代理头，回落 TCP 对端。
+func (t *requestTrace) captureClientInfo(r *http.Request, proxy *TrustedProxyMatcher) {
 	if t == nil || r == nil {
 		return
 	}
-	t.clientIP = clientIPForLog(r)
+	t.clientIP = extractClientIP(proxy, r)
 	t.userAgent = logfmt.Truncate(r.UserAgent(), maxUserAgentLen)
 }
 
-// clientIPForLog 提取用于日志展示的客户端 IP。
+// clientIPForLog 提取用于日志展示的客户端 IP（历史语义，无条件信任代理头）。
 //
-// 与 upstream.ExtractClientIP 的差别：后者只认代理头（X-Forwarded-For 首段 →
-// X-Real-IP），因为它的用途是把客户端 IP **透传给上游**，回落到网关自身地址会
-// 污染上游风控判据；日志场景相反——直连（无反代）时 RemoteAddr 就是唯一线索，
-// 必须回落，否则面板里所有来源都显示 "-"。代理头优先保证反代后拿到真实客户端。
+// 生产路径已改用 extractClientIP（F-002：按受信任代理判定，未配置受信任代理时
+// 不采信伪造的 X-Forwarded-For）。本函数保留为「不设受信任代理」时的旧语义，
+// 其回落 RemoteAddr 的行为由 logging_test 钉住（直连部署下 RemoteAddr 是唯一线索）。
+// 新增代码请用 extractClientIP，不要再用本函数拼 IP 采集。
 func clientIPForLog(r *http.Request) string {
 	if r == nil {
 		return ""

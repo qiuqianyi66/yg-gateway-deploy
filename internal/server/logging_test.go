@@ -141,7 +141,8 @@ func TestRequestMetricsRecordsStream(t *testing.T) {
 	}
 }
 
-// 调用来源必须进归档事件：X-Forwarded-For 首段（反代后真实客户端）+ 截断后的 UA。
+// 调用来源必须进归档事件：命中受信任代理时采信 X-Forwarded-For 首段（反代后真实
+// 客户端）+ 截断后的 UA。F-002 起，未配置受信任代理时不再无条件采信 XFF。
 func TestRequestMetricsCapturesClientInfo(t *testing.T) {
 	up := newFakeUpstream(t, func(string) (int, string, bool) {
 		return 200, sseOK, true
@@ -152,9 +153,12 @@ func TestRequestMetricsCapturesClientInfo(t *testing.T) {
 		Upstream:         up,
 		RequestLog:       reqLog,
 		RecordClientInfo: true,
+		// 受信任代理：来源落在 10.0.0.0/8 内才采信 XFF（反代部署）
+		TrustedProxy: NewTrustedProxyMatcher("10.0.0.0/8"),
 	})
 	req := httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+	req.RemoteAddr = "10.0.0.1:443" // 来源是受信任反代
 	req.Header.Set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
 	req.Header.Set("User-Agent", "python-requests/2.31.0")
 	rec := httptest.NewRecorder()
@@ -171,6 +175,38 @@ func TestRequestMetricsCapturesClientInfo(t *testing.T) {
 	}
 	if got := s.Recent[0].UserAgent; got != "python-requests/2.31.0" {
 		t.Errorf("user agent = %q", got)
+	}
+}
+
+// TestRequestMetricsIgnoresForgedXFF 未配置受信任代理时，伪造 XFF 不进归档（回落 RemoteAddr）。
+// 这是 F-002 的端到端牙齿：直连部署下客户端伪造 XFF 不得污染日志与透传。
+func TestRequestMetricsIgnoresForgedXFF(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) {
+		return 200, sseOK, true
+	})
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(Config{
+		Pool:             testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream:         up,
+		RequestLog:       reqLog,
+		RecordClientInfo: true,
+		// 不设 TrustedProxy → 不信任任何代理头
+	})
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[]}`))
+	req.RemoteAddr = "198.51.100.9:54321" // 直连客户端
+	req.Header.Set("X-Forwarded-For", "169.254.169.254")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	s := reqLog.Snapshot()
+	if len(s.Recent) != 1 {
+		t.Fatalf("recent = %+v", s.Recent)
+	}
+	if got := s.Recent[0].ClientIP; got != "198.51.100.9" {
+		t.Errorf("client ip = %q want 198.51.100.9 (伪造 XFF 不得采信，回落 RemoteAddr)", got)
 	}
 }
 
@@ -229,7 +265,7 @@ func TestCaptureClientInfoTruncatesUserAgent(t *testing.T) {
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
 	req.RemoteAddr = "198.51.100.9:1234"
 	req.Header.Set("User-Agent", strings.Repeat("A", 5000))
-	tr.captureClientInfo(req)
+	tr.captureClientInfo(req, nil)
 	if len(tr.userAgent) != maxUserAgentLen {
 		t.Fatalf("ua len = %d want %d", len(tr.userAgent), maxUserAgentLen)
 	}

@@ -859,3 +859,58 @@ func TestServerReadTimeout(t *testing.T) {
 		t.Error("unparsable read_timeout should fail fast")
 	}
 }
+
+// TestReadOnlyRateLimitConfig 只读端点限流配置解析（F-003）：
+// limit<=0 或 window 空/非法 = 不限流；给了 limit 但 window 空/非法 = fail fast。
+func TestReadOnlyRateLimitConfig(t *testing.T) {
+	// 默认：不限流（limit=0）
+	c := Default()
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize default: %v", err)
+	}
+	if c.ReadOnlyRateLimitWindow != 0 {
+		t.Errorf("default window=%v want 0 (不限流)", c.ReadOnlyRateLimitWindow)
+	}
+
+	// 给了 limit 但 window 为空 → fail fast（用户想限流但配错，不能静默关掉防护）
+	c = Default()
+	c.Security.ReadOnlyRateLimit.Limit = 10
+	c.Security.ReadOnlyRateLimit.Window = ""
+	if err := c.normalize(); err == nil {
+		t.Error("limit>0 但 window 空应 fail fast")
+	}
+
+	// window 非法 → fail fast
+	c = Default()
+	c.Security.ReadOnlyRateLimit.Limit = 10
+	c.Security.ReadOnlyRateLimit.Window = "bogus"
+	if err := c.normalize(); err == nil {
+		t.Error("非法 window 应 fail fast")
+	}
+
+	// 合法：limit>0 + window 合法 → 解析出窗口
+	c = Default()
+	c.Security.ReadOnlyRateLimit.Limit = 30
+	c.Security.ReadOnlyRateLimit.Window = "1m"
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize valid: %v", err)
+	}
+	if c.ReadOnlyRateLimitWindow != time.Minute {
+		t.Errorf("window=%v want 1m", c.ReadOnlyRateLimitWindow)
+	}
+}
+
+// TestMaxBodyBytesConfig 入站 body 上限（F-001）：0 = 不设限（旧行为），正数保留原值。
+func TestMaxBodyBytesConfig(t *testing.T) {
+	c := Default()
+	if c.Server.MaxBodyBytes != 0 {
+		t.Errorf("default max_body_bytes=%d want 0 (旧行为：不设限)", c.Server.MaxBodyBytes)
+	}
+	c.Server.MaxBodyBytes = 64 << 20
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.Server.MaxBodyBytes != 64<<20 {
+		t.Errorf("max_body_bytes=%d want 64MiB (显式值保留)", c.Server.MaxBodyBytes)
+	}
+}

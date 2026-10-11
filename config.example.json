@@ -4,7 +4,15 @@
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "server": {
-    "read_timeout": "300s"
+    "read_timeout": "300s",
+    "max_body_bytes": 67108864
+  },
+  "security": {
+    "trusted_proxy": "",
+    "read_only_rate_limit": {
+      "limit": 0,
+      "window": "1m"
+    }
   },
   "panel": {
     "package_detail_limit": 5
