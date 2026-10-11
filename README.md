@@ -2,7 +2,7 @@
 
 自托管的 **OpenAI 兼容反向代理网关**：把腾讯 CodeBuddy 账号池包装成统一的 `/v1/chat/completions` 服务，附带 Web 管理面板与全自动养号。
 
-**这是 YG 的私有部署版本**，从 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) v1.13.0 独立而来，此后自行演进、不再跟随上游。原始项目链：`Sliverkiss/workbuddy2api`（已删库）→ `linguo2625469/workbuddy2api-panel` → 本仓库。MIT 协议，版权声明见 [LICENSE](LICENSE)。
+本项目从 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) v1.13.0 独立而来，此后自行演进、不再跟随上游。原始项目链：`Sliverkiss/workbuddy2api`（已删库）→ `linguo2625469/workbuddy2api-panel` → 本仓库。MIT 协议，版权声明见 [LICENSE](LICENSE)。
 
 ---
 

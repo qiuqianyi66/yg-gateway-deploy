@@ -38,6 +38,9 @@ backups/
 /PLAN.md
 /SPEC.md
 
+# 私有提示词资产（个人人格位，非项目必需；开源版用 config.example.json 的默认 passthrough）
+/persona.md
+
 # ── 文档与治理：默认跟踪 ─────────────────────────────────────────────────
 # 早期沿用上游的 `*.md` + `docs/` 全忽略策略，副作用是 .harness 规范、docs/prd
 # 需求文档、.harness/changes 变更记录全部无法入库——十阶段流水线的「可追溯」因此
