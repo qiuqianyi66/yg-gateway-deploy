@@ -23,6 +23,9 @@ __pycache__/
 # Binary backups（部署前留的旧版二进制，含凭证无关但体积大，不入库）
 bin/
 
+# 真机验证产物（Playwright 截图等，属本地验证证据，复现命令见 review.md）
+verify/
+
 # Backups (contains auth tokens)
 backups/
 
