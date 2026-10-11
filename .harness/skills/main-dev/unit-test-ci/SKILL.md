@@ -15,7 +15,7 @@ verification: go build ./... && go vet ./... && go test ./...
 
 1. **构建**：`go build ./...`（0 error）
 2. **静态检查**：`go vet ./...`（0 输出）
-3. **测试**：`go test ./...`（全绿，16 包）
+3. **测试**：`go test ./...`（全绿；包数随 cmd/internal 演进会变，不写死）
 4. **前端语法**：`node --check internal/panel/app.js`（app.js 是 go:embed，Go 编译器不查其内容，一次语法错误就让面板白屏而 Go 测试全绿——必须单独校验）
 5. **漏洞扫描**（依赖/安全相关改动时）：`govulncheck ./...`（零告警；工具链必须 Go 1.27.2+，低版本带 9 个 stdlib CVE）
 6. **XSS 探针**（面板改动时）：4 种 payload 注入 → foreign tags NONE / event attrs NONE → SAFE

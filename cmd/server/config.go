@@ -53,8 +53,12 @@ type Config struct {
 		ReadTimeout string `json:"read_timeout"` // "300s"；"0" = 不限制
 		// MaxBodyBytes /v1/chat/completions 入站请求体字节上限（F-001）。
 		// 超限返回 413，读取阶段即被 MaxBytesReader 截断（超大 body 不整体进内存）。
-		// 0 = 不设上限（旧行为）；生产建议 64MB（64<<20）。改动需重启进程。
-		MaxBodyBytes int64 `json:"max_body_bytes"`
+		// 指针语义区分「未配置」与「显式关闭」：
+		//   nil        = 未配置 → normalize 回落默认 64MB（安全默认，DoS 防护恒开）
+		//   &0（写 0） = 显式不设上限（用户明确要旧行为，自担风险）
+		//   &N         = N 字节上限
+		// 改动需重启进程。
+		MaxBodyBytes *int64 `json:"max_body_bytes"`
 	} `json:"server"`
 
 	Security struct {
@@ -252,6 +256,9 @@ type Config struct {
 	ServerReadTimeoutDur time.Duration `json:"-"`
 	// ReadOnlyRateLimitWindow 解析后的只读端点限流窗口（F-003）；0 = 不限流。
 	ReadOnlyRateLimitWindow time.Duration `json:"-"`
+	// MaxBodyBytesEffective 解析后的 body 上限（F-001）：nil（未配置）回落默认 64MB，
+	// 显式 0 = 不限（0 传给 handler 表示关闭 MaxBytesReader）。
+	MaxBodyBytesEffective int64 `json:"-"`
 }
 
 // Default 默认配置。
@@ -496,6 +503,16 @@ func (c *Config) normalize() error {
 	}
 	if c.ServerReadTimeoutDur < 0 {
 		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
+	}
+	// 入站 body 上限（F-001）：nil（未配置）回落默认 64MB，DoS 防护恒开；
+	// 显式 0 = 不限（旧行为，用户明确关闭）；负值无意义 fail fast。
+	if c.Server.MaxBodyBytes == nil {
+		c.MaxBodyBytesEffective = 64 << 20 // 64MB 安全默认
+	} else {
+		if *c.Server.MaxBodyBytes < 0 {
+			return fmt.Errorf("server.max_body_bytes: 负值 %d 无意义（0=不设限，正数=上限）", *c.Server.MaxBodyBytes)
+		}
+		c.MaxBodyBytesEffective = *c.Server.MaxBodyBytes
 	}
 	// 只读端点限流窗口（F-003）：limit<=0 或 window 空/非法 = 不限流（旧行为）。
 	// window 合法但 limit<=0 时静默不限流（配置了窗口但没给额度 = 用户想关限流）；

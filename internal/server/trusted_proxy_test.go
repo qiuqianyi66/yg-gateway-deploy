@@ -54,7 +54,7 @@ func TestExtractClientIPNoTrustedProxy(t *testing.T) {
 	}
 }
 
-// TestExtractClientIPTrustedProxy 命中受信任代理时才采信 XFF 首段。
+// TestExtractClientIPTrustedProxy 命中受信任代理时，从右往左取第一个非受信任 IP。
 func TestExtractClientIPTrustedProxy(t *testing.T) {
 	m := NewTrustedProxyMatcher("10.0.0.0/8")
 	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
@@ -62,7 +62,34 @@ func TestExtractClientIPTrustedProxy(t *testing.T) {
 	req.Header.Set("X-Forwarded-For", "203.0.113.7, 10.0.0.1")
 
 	if got := extractClientIP(m, req); got != "203.0.113.7" {
-		t.Fatalf("extractClientIP(trusted) = %q want 203.0.113.7（受信任反代后取 XFF 首段）", got)
+		t.Fatalf("extractClientIP(trusted) = %q want 203.0.113.7（受信任反代后取真实客户端）", got)
+	}
+}
+
+// TestExtractClientIPAppendSemantics 追加语义防绕过（F-002 核心牙齿）：
+// 受信任代理用 $proxy_add_x_forwarded_for 追加时，首段仍是客户端伪造值，
+// 但真实客户端是「从右往左第一个非受信任 IP」。还原「取首段」的 bug 必须 FAIL。
+func TestExtractClientIPAppendSemantics(t *testing.T) {
+	m := NewTrustedProxyMatcher("10.0.0.0/8")
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.RemoteAddr = "10.0.0.1:443" // 来源是受信任反代
+	// 追加语义：客户端伪造 169.254.169.254 在首段，反代追加真实对端 198.51.100.9 在尾段
+	req.Header.Set("X-Forwarded-For", "169.254.169.254, 198.51.100.9")
+
+	if got := extractClientIP(m, req); got != "198.51.100.9" {
+		t.Fatalf("extractClientIP(append) = %q want 198.51.100.9（从右往左取第一个非受信任 IP，首段伪造不得采信）", got)
+	}
+}
+
+// TestExtractClientIPXRealIPFallback 无 XFF 时回落 X-Real-IP（单值，无追加语义问题）。
+func TestExtractClientIPXRealIPFallback(t *testing.T) {
+	m := NewTrustedProxyMatcher("10.0.0.0/8")
+	req := httptest.NewRequest("POST", "/v1/chat/completions", nil)
+	req.RemoteAddr = "10.0.0.1:443"
+	req.Header.Set("X-Real-IP", "198.51.100.9")
+
+	if got := extractClientIP(m, req); got != "198.51.100.9" {
+		t.Fatalf("extractClientIP(x-real-ip) = %q want 198.51.100.9", got)
 	}
 }
 

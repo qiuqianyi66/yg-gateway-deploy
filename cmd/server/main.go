@@ -316,7 +316,7 @@ func main() {
 		// handler 侧第三道闸（global realm）：false（显式逃生门）时不列 global: 模型名。
 		GlobalEnabled: cfg.Global.Enabled,
 		// 入站边界加固（F-001/F-002/F-003）：装配期固定，改动需重启。
-		MaxBodyBytes: cfg.Server.MaxBodyBytes,
+		MaxBodyBytes: cfg.MaxBodyBytesEffective,
 		TrustedProxy: server.NewTrustedProxyMatcher(cfg.Security.TrustedProxy),
 		ReadOnlyRateLimit: func() *server.ReadOnlyRateLimit {
 			if cfg.Security.ReadOnlyRateLimit.Limit <= 0 || cfg.ReadOnlyRateLimitWindow <= 0 {

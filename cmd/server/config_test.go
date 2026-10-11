@@ -900,17 +900,48 @@ func TestReadOnlyRateLimitConfig(t *testing.T) {
 	}
 }
 
-// TestMaxBodyBytesConfig 入站 body 上限（F-001）：0 = 不设限（旧行为），正数保留原值。
+// TestMaxBodyBytesConfig 入站 body 上限（F-001）：
+// nil（未配置）→ 回落默认 64MB（DoS 防护恒开）；显式 0 → 不限（旧行为）；负值 fail fast。
 func TestMaxBodyBytesConfig(t *testing.T) {
+	// 默认：未配置（nil）→ 回落 64MB 安全默认
 	c := Default()
-	if c.Server.MaxBodyBytes != 0 {
-		t.Errorf("default max_body_bytes=%d want 0 (旧行为：不设限)", c.Server.MaxBodyBytes)
+	if c.Server.MaxBodyBytes != nil {
+		t.Errorf("default max_body_bytes 应为 nil（未配置），got %v", *c.Server.MaxBodyBytes)
 	}
-	c.Server.MaxBodyBytes = 64 << 20
 	if err := c.normalize(); err != nil {
-		t.Fatalf("normalize: %v", err)
+		t.Fatalf("normalize default: %v", err)
 	}
-	if c.Server.MaxBodyBytes != 64<<20 {
-		t.Errorf("max_body_bytes=%d want 64MiB (显式值保留)", c.Server.MaxBodyBytes)
+	if c.MaxBodyBytesEffective != 64<<20 {
+		t.Errorf("default effective=%d want 64MiB（安全默认恒开）", c.MaxBodyBytesEffective)
+	}
+
+	// 显式 0 → 不限（用户明确关闭，保留旧行为逃生门）
+	c = Default()
+	zero := int64(0)
+	c.Server.MaxBodyBytes = &zero
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize zero: %v", err)
+	}
+	if c.MaxBodyBytesEffective != 0 {
+		t.Errorf("explicit 0 effective=%d want 0（不限）", c.MaxBodyBytesEffective)
+	}
+
+	// 显式正数 → 保留原值
+	c = Default()
+	n := int64(128 << 20)
+	c.Server.MaxBodyBytes = &n
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize 128MiB: %v", err)
+	}
+	if c.MaxBodyBytesEffective != 128<<20 {
+		t.Errorf("explicit 128MiB effective=%d want 128MiB", c.MaxBodyBytesEffective)
+	}
+
+	// 负值 → fail fast（静默钳 0 会把防护悄悄关掉）
+	c = Default()
+	neg := int64(-1)
+	c.Server.MaxBodyBytes = &neg
+	if err := c.normalize(); err == nil {
+		t.Error("负 max_body_bytes 应 fail fast")
 	}
 }

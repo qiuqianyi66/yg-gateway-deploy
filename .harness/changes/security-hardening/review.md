@@ -66,3 +66,26 @@
    matcher 统一语义——当前保留因为它钉住了「回落 RemoteAddr」的旧行为，删了要同步改测试。
 2. 🟢 限流器是固定窗口（边界处允许瞬时 2× 突发）。对「防无脑刷取」够用；若未来要做
    精确配额（计费场景），再换令牌桶/滑窗。
+
+## 七、独立 reviewer 二轮评审（subagent 结果与处置）
+
+独立 reviewer（requesting-code-review 派发）复核 5ee072d，结论「可合入（有条件），
+无 🔴」。4 条 🟡 的处置：
+
+| # | reviewer 发现 | 处置 |
+|---|---|---|
+| 🟡#1 | MaxBodyBytes 默认 0=不限，DoS 对存量用户仍敞开 | **确认成立，已修**：改指针字段 `*int64`，nil（未配置）→ normalize 回落 64MB 安全默认；显式 0 → 不限（逃生门）；负值 fail fast |
+| 🟡#2 | 受信任代理用「追加」语义拼 XFF（nginx $proxy_add_x_forwarded_for）时首段仍客户端可控，绕过 F-002 | **确认成立，已修**：`trustedClientIP` 从右往左跳过受信任代理、取第一个非受信任 IP；追加语义下取真实客户端，重写语义下无回归。牙齿验证：注入「取首段」→ 测试报 `extractClientIP(append) = 169.254.169.254` |
+| 🟡#3 | rateLimiter.counts map 无逐 key 淘汰，单窗口 distinct IP 可撑大内存 | **部分成立，可接受**：窗口滑过即整体重建 map（`rl.counts = map[string]int{}`），内存随窗口长度有界。个人网关窗口 ≤ 分钟级，风险可忽略。记录不改 |
+| 🟡#4 | 漏配 trusted_proxy 时，限流退化为全局单桶，单客户端可 429 所有人 | **评审有误，反驳**：`extractClientIP` 未配置 trusted_proxy 时回落 `RemoteAddr`（每客户端不同的 TCP 对端 IP），限流按真实对端计数，非全局单桶。真正退化为全局单桶的只有 `RemoteAddr` 为空/解析失败的极端兜底（`\x00global` 分支），属防御性极端路径 |
+
+### 附带修正（reviewer 问题②）
+
+`unit-test-ci` 技能硬编码「16 包」，与实况漂移（实际 `go list ./...` = 19 包，其中
+15 个有测试 ok + 4 个 no test files）。已改为「包数随演进会变，不写死」。
+
+### 附带补齐（reviewer 问题①：CI 门禁脱节）
+
+`unit-test-ci` 技能承诺的 `go vet` + `govulncheck` + `node --check` 门禁，此前在真实
+CI（go-binaries.yml）里只跑了 `go test ./...`——技能说了、CI 没做。已补上：
+`go vet ./...` + `node --check internal/panel/app.js` + `govulncheck ./...`。

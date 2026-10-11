@@ -14,8 +14,6 @@ import (
 	"net"
 	"net/http"
 	"strings"
-
-	"yg-gateway/internal/upstream"
 )
 
 // TrustedProxyMatcher 判定一个来源 IP 是否属于受信任的反向代理。
@@ -87,18 +85,25 @@ func (m *TrustedProxyMatcher) Match(src string) bool {
 // 规则：
 //   - m 为 nil（未配置受信任代理）→ 忽略代理头，回落 TCP 对端 RemoteAddr。
 //     这是直连部署的安全默认：客户端伪造的 X-Forwarded-For 不被采信、不透传上游。
-//   - m 非 nil 且请求来源命中受信任代理 → 采信代理头（upstream.ExtractClientIP），
-//     反代场景拿到真实客户端。
+//   - m 非 nil 且请求来源命中受信任代理 → 解析代理头，从**右往左**跳过受信任代理，
+//     取第一个非受信任 IP 作为真实客户端（见「追加语义」说明）。
 //   - m 非 nil 但来源未命中（伪造/直连混用）→ 忽略代理头，回落 RemoteAddr。
 //
+// 追加语义（重要，防 XFF 伪造）：
+//   若受信任代理用「追加」方式拼 XFF（如 nginx 的 $proxy_add_x_forwarded_for 会把
+//   客户端送来的 XFF 原样保留、再在末尾追加真实对端），那么「首段」仍是客户端
+//   可控的伪造值——取首段会绕过本防护。正确做法是从右往左跳过受信任代理，取第一个
+//   非受信任 IP：追加语义下它才是真实客户端；重写语义下（XFF 只有一个真实客户端
+//   IP）结果相同，无回归。
+//
 // 与 upstream.ExtractClientIP 的差别：后者无条件取代理头首段，只该在**已确认
-// 来源可信**之后调用；本函数是那层「确认可信」的闸门。
+// 来源可信**之后调用；本函数是那层「确认可信」的闸门，且处理追加语义。
 func extractClientIP(m *TrustedProxyMatcher, r *http.Request) string {
 	if r == nil {
 		return ""
 	}
 	if m != nil && m.Match(r.RemoteAddr) {
-		if ip := upstream.ExtractClientIP(r); ip != "" {
+		if ip := trustedClientIP(m, r); ip != "" {
 			return ip
 		}
 	}
@@ -107,4 +112,27 @@ func extractClientIP(m *TrustedProxyMatcher, r *http.Request) string {
 		return strings.TrimSpace(r.RemoteAddr)
 	}
 	return host
+}
+
+// trustedClientIP 从代理头解析真实客户端 IP：从右往左跳过受信任代理，取第一个
+// 非受信任 IP。XFF 可能逗号分隔多段（"client, proxy1, proxy2"），从右往左读到
+// 第一个非受信任段即返回；全为受信任段（异常）时返回最右段。
+func trustedClientIP(m *TrustedProxyMatcher, r *http.Request) string {
+	xff := r.Header.Get("X-Forwarded-For")
+	if xff == "" {
+		// 无 XFF 时回 X-Real-IP（单值，无追加语义问题）
+		return strings.TrimSpace(r.Header.Get("X-Real-IP"))
+	}
+	parts := strings.Split(xff, ",")
+	for i := len(parts) - 1; i >= 0; i-- {
+		part := strings.TrimSpace(parts[i])
+		if part == "" {
+			continue
+		}
+		if !m.Match(part) {
+			return part // 第一个非受信任 IP = 真实客户端
+		}
+	}
+	// 全为受信任段（理论上不该发生），退回最右段
+	return strings.TrimSpace(parts[len(parts)-1])
 }
