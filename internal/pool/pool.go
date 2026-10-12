@@ -3,6 +3,7 @@
 package pool
 
 import (
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -34,8 +35,12 @@ type Pool struct {
 	// 运行态（不持久化，同 lastUsed/usedSeq 口径）：重启归零 → 每个仍冻结的
 	// (域, 模型) 多至 1 次即时重探；已毕业号经 ModelCosts 恢复 tier，学费不重付。
 	// 只在探索事件时写入（tier 1 枯竭期间停走，陈旧无害）；不做对称清理。
+	// exploreMu（ADR-005 D-500）：pick 改读锁后 map 不能在读锁下写；且「窗口
+	// 判定 + 置位」必须原子（否则并发 pick 重复探索），独立小锁避免把写锁拉回
+	// 热路径。读侧（CostExploreStatus）同样走 exploreMu。
+	exploreMu   sync.Mutex
 	exploreLast map[string]time.Time
-	// costExploreEvents 累计探索事件数（/status 透出；pick 写锁内 ++，无需 atomic）。
+	// costExploreEvents 累计探索事件数（/status 透出；exploreMu 保护）。
 	costExploreEvents int64
 	// degradeThreshold / degradeCooldown / degradeCooldownMax 连败降权参数
 	// （SetDegrade 注入；默认值见 defaultDegrade*，issue #114）。
@@ -60,6 +65,12 @@ type Pool struct {
 	// preferExpiring 最早到期优先路由开关（默认 true）。开启且快过期窗口内存在有效
 	// 批次时，选号在成本层内先按最早到期排序；关闭后只使用普通加权路由。
 	preferExpiring bool
+	// ewmaEnabled / ewmaAlpha / ewmaMinSamples EWMA 表现回灌参数（ADR-005 D-502，
+	// SetEwma 注入；默认关闭 = 零回归）。ewmaEnabled 为 false 时权重因子恒 1，
+	// 与现状逐位一致；alpha/minSamples 见 entry.go defaultEwma*。
+	ewmaEnabled    bool
+	ewmaAlpha      float64
+	ewmaMinSamples int64
 	// maxInFlight 单账号最大在途请求数；0 = 不限（租约关闭）。
 	maxInFlight int
 	// maxInFlightGlobal global 域单账号在途上限分档（WAF 403 修复 P1-1：global 域
@@ -68,13 +79,24 @@ type Pool struct {
 	// randInt64N 仅供测试注入确定性随机源；nil 时用 math/rand/v2 全局源。
 	// 生产代码不应设置此字段。
 	randInt64N func(n int64) int64
+	// breakerProbeGap 熔断到期后的 half-open 试探间隔（ADR-003 D-400）：
+	// 熔断号到期后不再一次性全量放回，而是每 gap 至多放行 1 次试探；成功即全量恢复。
+	// 0 = 关闭 half-open（退化为既有的「到期即全量」行为，零回归）。
+	breakerProbeGap time.Duration
+	// globalMaxInFlight 全局在途上限（ADR-003 D-401）：所有账号在途请求总数上限，
+	// 超限立即 429 不排队。0 = 不限（默认，零回归）。经 globalInFlight 原子计数判定。
+	globalMaxInFlight int
+	// globalInFlight 全局在途原子计数（ADR-003 D-401）：Acquire 成功 +1、Release -1，
+	// 严格配对。与每账号 inFlight 并存（后者是 per-account 上限，本字段是全局上限）。
+	globalInFlight atomic.Int64
 	// persistFails 本地 state.json 连续落盘失败计数（仅 saveLocked 在持锁下读写，无需 atomic）。
 	// 用于落盘失败的日志节流：首败/每 N 次提醒/恢复各打一条，避免磁盘满时刷屏。
 	persistFails int
 	// pickSeq 单调递增的选号序号：每次 pick 选中账号时自增并记到 entry.usedSeq，
 	// 为 LRU 兜底/防惊群提供与 time.Now() 精度无关的严格全序（Windows ~0.5ms 精度下
-	// lastUsed 墙钟会全等）。仅 pick 写锁路径读写，无需 atomic。
-	pickSeq uint64
+	// lastUsed 墙钟会全等）。atomic（ADR-005 D-500）：pick 改读锁后由读锁路径
+	// Add(1) 分配序号，普通字段跨读锁写会成数据竞争。
+	pickSeq atomic.Uint64
 	// stopCh 关闭信号：Close 关闭它使 startFlusher 的后台 goroutine 退出。
 	// nil = 未启动 flusher（stateFp 为空时 New 不起 flusher）。
 	stopCh chan struct{}
@@ -93,6 +115,10 @@ func New(stateFp string) *Pool {
 		idleWeightPerHour:  defaultIdleWeightPerHour,
 		idleWeightMax:      defaultIdleWeightMax,
 		preferExpiring:     true,
+		// EWMA 表现回灌（ADR-005 D-502）：默认关闭（零回归），SetEwma 从 config
+		// 注入后生效；alpha/minSamples 的默认值供未注入（测试/嵌入式）场景兜底。
+		ewmaAlpha:          defaultEwmaAlpha,
+		ewmaMinSamples:     defaultEwmaMinSamples,
 		degradeThreshold:   defaultDegradeThreshold,
 		degradeCooldown:    defaultDegradeCooldown,
 		degradeCooldownMax: defaultDegradeCooldownMax,
@@ -136,6 +162,82 @@ func (p *Pool) SetBreaker(threshold int, cooldown, cooldownMax time.Duration) {
 	}
 }
 
+// SetEwma 注入 EWMA 表现回灌参数（ADR-005 D-502，main 从 config 解析后调用）。
+// enabled=false 时权重因子恒 1（完全回到现状行为）；alpha 非 (0,1] 保留默认；
+// minSamples<=0 保留默认。热生效（与 pool.* 其余 Set* 同口径）。
+func (p *Pool) SetEwma(enabled bool, alpha float64, minSamples int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.ewmaEnabled = enabled
+	if alpha > 0 && alpha <= 1 {
+		p.ewmaAlpha = alpha
+	}
+	if minSamples > 0 {
+		p.ewmaMinSamples = int64(minSamples)
+	}
+}
+
+// SetBreakerProbeGap 注入熔断 half-open 试探间隔（ADR-003 D-400）。
+// 0（或负）= 关闭 half-open，退化为「到期即全量放回」的既有行为。
+func (p *Pool) SetBreakerProbeGap(d time.Duration) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if d < 0 {
+		d = 0
+	}
+	p.breakerProbeGap = d
+}
+
+// SetGlobalMaxInFlight 注入全局在途上限（ADR-003 D-401）。0（或负）= 不限。
+func (p *Pool) SetGlobalMaxInFlight(n int) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if n < 0 {
+		n = 0
+	}
+	p.globalMaxInFlight = n
+}
+
+// GlobalInFlight 返回当前全局在途请求数（ADR-003 D-401，/status 与准入判定用）。
+func (p *Pool) GlobalInFlight() int64 {
+	return p.globalInFlight.Load()
+}
+
+// AcquireGlobal 全局准入判定（ADR-003 D-401）：未配置上限恒放行；否则在
+// 「当前在途 < 上限」时占用一个名额并返回 true。占用成功后**必须**配对调用
+// ReleaseGlobal（handler 用 defer 保证）。
+//
+// 为什么用 CAS 循环而不是先读后写：并发下「读-判-写」会超发（多个 goroutine
+// 同时读到 n-1 都以为还有名额）。CAS 保证不超发，且无需锁。
+func (p *Pool) AcquireGlobal() bool {
+	limit := p.globalMaxInFlight
+	if limit <= 0 {
+		return true // 未配置上限：恒放行（零回归）
+	}
+	for {
+		cur := p.globalInFlight.Load()
+		if cur >= int64(limit) {
+			return false
+		}
+		if p.globalInFlight.CompareAndSwap(cur, cur+1) {
+			return true
+		}
+	}
+}
+
+// ReleaseGlobal 释放一个全局在途名额（与 AcquireGlobal 严格配对）。
+// 未配置上限时是空操作（因为 AcquireGlobal 没有真的占名额）。
+func (p *Pool) ReleaseGlobal() {
+	if p.globalMaxInFlight <= 0 {
+		return
+	}
+	// 防御性下溢保护：正常配对下不会负；异常路径（重复 Release）只记不崩。
+	if v := p.globalInFlight.Add(-1); v < 0 {
+		p.globalInFlight.Store(0)
+		log.Printf("WARN: [pool] globalInFlight 下溢（Release 不配对？）已钳 0")
+	}
+}
+
 // SetSoftRateMax 注入软冷却指数退避的封顶时长（main 从 config 解析后调用）。
 // 非正值保留原值（用默认 2h），风格同 SetBreaker。
 func (p *Pool) SetSoftRateMax(d time.Duration) {
@@ -164,8 +266,8 @@ func (p *Pool) SetCostExploreInterval(d time.Duration) {
 // 「探索→毕业」全链路）。RLock 只读遍历；map 大小受「服务过的 (域, 模型)」集合
 // 约束（与 modelCost 同界，天然有界）。
 func (p *Pool) CostExploreStatus() (events int64, last map[string]time.Time) {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
+	p.exploreMu.Lock()
+	defer p.exploreMu.Unlock()
 	last = make(map[string]time.Time, len(p.exploreLast))
 	for k, ts := range p.exploreLast {
 		// 键 realm+"\x1f"+model → 输出 "|"（JSON 安全可读；\x1f 不可打印）。

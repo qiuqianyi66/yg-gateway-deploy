@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"io"
@@ -15,9 +16,12 @@ import (
 	"time"
 
 	"yg-gateway/internal/auth"
+	"yg-gateway/internal/httpauth"
+	"yg-gateway/internal/livecfg"
 	"yg-gateway/internal/pool"
 	"yg-gateway/internal/prompt"
 	"yg-gateway/internal/redisstore"
+	"yg-gateway/internal/reqlog"
 	"yg-gateway/internal/session"
 	"yg-gateway/internal/upstream"
 	"yg-gateway/internal/usage"
@@ -1071,6 +1075,167 @@ func TestAPIKeyAuth(t *testing.T) {
 	h.ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Errorf("right key: code=%d", rec.Code)
+	}
+}
+
+// TestMultiKeyAuth 多 Key 鉴权（T4）：live 快照带 AuthIndex，单值 + 多 Key 均放行。
+func TestMultiKeyAuth(t *testing.T) {
+	sumA := sha256Of("sk-multi-a")
+	sumB := sha256Of("sk-multi-b")
+	idx := httpauth.BuildIndex([]httpauth.Key{
+		{ID: "k-a", Digest: sumA},
+		{ID: "k-b", Digest: sumB},
+	})
+	live := livecfg.New(livecfg.Snapshot{
+		AuthIndex: idx,
+		APIKey:    "single",
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: upstream.New(),
+		Live:     live,
+	})
+
+	// 多 Key 之一放行
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer sk-multi-a")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Errorf("multi key A: code=%d, want 200", rec.Code)
+	}
+
+	// 未知 key 拒绝
+	req = httptest.NewRequest("GET", "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer sk-unknown")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != 401 {
+		t.Errorf("unknown key: code=%d, want 401", rec.Code)
+	}
+}
+
+// sha256Of 计算 SHA256 摘要（测试辅助）。
+func sha256Of(s string) []byte {
+	sum := sha256.Sum256([]byte(s))
+	return sum[:]
+}
+
+// TestKeyConstraintsBlockBeforeUpstream 约束拒绝发生在选号/出站之前：白名单外模型
+// 直接 400，不产生任何上游请求（零上游消耗，ADR-001 §五）。
+func TestKeyConstraintsBlockBeforeUpstream(t *testing.T) {
+	var upstreamCalls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		upstreamCalls++
+		return 200, sseOK, true
+	})
+	sum := sha256Of("sk-constrained")
+	idx := httpauth.BuildIndex([]httpauth.Key{
+		{ID: "k1", Name: "甲", Digest: sum, Models: []string{"allowed-model"}},
+	})
+	live := livecfg.New(livecfg.Snapshot{AuthIndex: idx})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: up,
+		Live:     live,
+	})
+
+	// 白名单外模型 → 400，零上游调用
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"forbidden-model","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer sk-constrained")
+	h.ServeHTTP(rec, req)
+	if rec.Code != 400 {
+		t.Fatalf("白名单外模型应 400，got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "model_not_allowed") {
+		t.Fatalf("错误码应为 model_not_allowed，body=%s", rec.Body.String())
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("约束拒绝不应打上游，got %d 次上游调用", upstreamCalls)
+	}
+}
+
+// TestKeyConstraintsModelTypeError 白名单启用时，model 字段类型非法（数字/对象等）
+// 直接 400 且不触发下游（T6 收尾：区分「缺 model」与「model 类型非法」）。
+func TestKeyConstraintsModelTypeError(t *testing.T) {
+	var upstreamCalls int
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		upstreamCalls++
+		return 200, sseOK, true
+	})
+	sum := sha256Of("sk-typed")
+	idx := httpauth.BuildIndex([]httpauth.Key{
+		{ID: "k1", Digest: sum, Models: []string{"allowed"}},
+	})
+	live := livecfg.New(livecfg.Snapshot{AuthIndex: idx})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream: up,
+		Live:     live,
+	})
+
+	// model 是数字（非字符串）→ 400 model_not_allowed，零上游
+	for _, body := range []string{
+		`{"model":123,"messages":[]}`,
+		`{"model":{"nested":true},"messages":[]}`,
+		`{"model":true,"messages":[]}`,
+	} {
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer sk-typed")
+		h.ServeHTTP(rec, req)
+		if rec.Code != 400 {
+			t.Fatalf("model 类型非法应 400，body=%s got %d", body, rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "model_not_allowed") {
+			t.Fatalf("错误码应为 model_not_allowed，body=%s", rec.Body.String())
+		}
+	}
+	if upstreamCalls != 0 {
+		t.Fatalf("类型非法不应打上游，got %d 次", upstreamCalls)
+	}
+}
+func TestKeyIdentityInRequestLog(t *testing.T) {
+	sum := sha256Of("sk-secret-key-value")
+	idx := httpauth.BuildIndex([]httpauth.Key{
+		{ID: "user-001", Name: "小明", Digest: sum},
+	})
+	live := livecfg.New(livecfg.Snapshot{AuthIndex: idx})
+	reqLog := reqlog.New(reqlog.Config{})
+	h := NewHandler(Config{
+		Pool:       testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}),
+		Upstream:   upstream.New(),
+		Live:       live,
+		RequestLog: reqLog,
+	})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[]}`))
+	req.Header.Set("Authorization", "Bearer sk-secret-key-value")
+	h.ServeHTTP(rec, req)
+
+	snap := reqLog.Snapshot()
+	if len(snap.Recent) != 1 {
+		t.Fatalf("应记录 1 条请求，got %d", len(snap.Recent))
+	}
+	ev := snap.Recent[0]
+	if ev.KeyID != "user-001" {
+		t.Errorf("key_id=%q want user-001", ev.KeyID)
+	}
+	if ev.KeyName != "小明" {
+		t.Errorf("key_name=%q want 小明", ev.KeyName)
+	}
+	// 脱敏：归档里不得出现 Key 明文或 Authorization 原文
+	if strings.Contains(rec.Body.String(), "sk-secret-key-value") {
+		t.Error("响应不应泄漏 Key 明文")
+	}
+	// 请求日志 Event 序列化后也不得含明文（Event 只有 id/name 字段）
+	b, _ := json.Marshal(ev)
+	if strings.Contains(string(b), "sk-secret-key-value") {
+		t.Errorf("归档事件泄漏 Key 明文: %s", b)
 	}
 }
 

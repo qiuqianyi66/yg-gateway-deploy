@@ -11,7 +11,7 @@
 :root {
   --bg: #0c0e14; --surface: #14171f; --surface-2: #1a1e28; --raise: #202531;
   --line: #262c3a; --line-soft: #1e232e;
-  --ink: #e8ebf2; --ink-2: #a8b0c2; --ink-3: #6b7488;
+  --ink: #e8ebf2; --ink-2: #a8b0c2; --ink-3: #7d8699;
   --accent: #5b7cfa; --accent-ink: #ffffff; --accent-soft: rgba(91,124,250,.13);
   --ok: #3ddc97; --ok-soft: rgba(61,220,151,.12);
   --warn: #f5b544; --warn-soft: rgba(245,181,68,.12);
@@ -23,10 +23,10 @@
 [data-theme="light"] {
   --bg: #f4f5f8; --surface: #ffffff; --surface-2: #f8f9fb; --raise: #ffffff;
   --line: #e2e5ec; --line-soft: #eceef3;
-  --ink: #14171f; --ink-2: #545c6e; --ink-3: #8b93a5;
+  --ink: #14171f; --ink-2: #545c6e; --ink-3: #6b7280;
   --accent: #3d5fe0; --accent-ink: #ffffff; --accent-soft: rgba(61,95,224,.09);
-  --ok: #0f9d63; --ok-soft: rgba(15,157,99,.1);
-  --warn: #b47611; --warn-soft: rgba(180,118,17,.11);
+  --ok: #0a7a4d; --ok-soft: rgba(10,122,77,.1);
+  --warn: #96610a; --warn-soft: rgba(150,97,10,.11);
   --bad: #cf3b34; --bad-soft: rgba(207,59,52,.09);
   --shadow: 0 1px 2px rgba(16,20,32,.06), 0 8px 24px -14px rgba(16,20,32,.14);
 }
@@ -40,6 +40,44 @@ body {
 ::selection { background: var(--accent-soft); }
 :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+
+/* ── 骨架屏（loading skeleton）───────────────────────────────────────
+   加载态此前是纯文本（"正在向上游查询…"），空白期长（逐账号查上游可能几十秒）
+   时看起来像卡死。骨架屏给出"正在加载且大致是这个形状"的预期。
+   动画在 prefers-reduced-motion 下由上面那条全局规则关闭。 */
+.skel {
+  background: linear-gradient(90deg, var(--surface-2) 25%, var(--raise) 50%, var(--surface-2) 75%);
+  background-size: 200% 100%;
+  animation: skel-shimmer 1.2s ease-in-out infinite;
+  border-radius: 5px;
+}
+@keyframes skel-shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
+.skel-row { display: flex; gap: 10px; align-items: center; padding: 12px 4px; }
+.skel-row .skel { height: 12px; }
+.skel-row .w-1 { width: 18%; } .skel-row .w-2 { width: 26%; }
+.skel-row .w-3 { width: 14%; } .skel-row .w-4 { width: 22%; }
+.skel-card { padding: 14px 16px; border: 1px solid var(--line-soft); border-radius: 10px; background: var(--surface-2); }
+.skel-card .skel { height: 12px; margin-bottom: 9px; }
+.skel-card .skel:last-child { margin-bottom: 0; }
+.skel-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; padding: 14px 17px; }
+.skel-kpi { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 10px; padding: 14px 17px 2px; }
+@media (max-width: 1180px) { .skel-kpi { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.skel-kpi > div { height: 74px; border-radius: 10px; }
+.skel-msg { display: flex; align-items: center; gap: 9px; color: var(--ink-3); font-size: 12.5px; }
+.skel-msg .spinner {
+  width: 13px; height: 13px; border: 2px solid var(--line); border-top-color: var(--accent);
+  border-radius: 50%; animation: skel-spin .7s linear infinite; flex: none;
+}
+@keyframes skel-spin { to { transform: rotate(360deg); } }
+
+/* ── 错误态（就地重试）───────────────────────────────────────────────
+   失败时给出「原因 + 就地重试按钮」，不要求用户滚回顶部找刷新。
+   结构对齐 Key 页既有的 .key-load-error（全站做得最好的一处）。 */
+.load-error {
+  padding: 28px 20px; text-align: center; color: var(--bad);
+}
+.load-error .big { font-size: 14px; margin-bottom: 6px; }
+.load-error .detail { font-size: 12.5px; color: var(--ink-3); margin-bottom: 12px; word-break: break-word; }
 
 /* ── 壳层：左侧导航 + 主区 ─────────────────────────────────────────── */
 .shell { display: grid; grid-template-columns: 208px 1fr; min-height: 100vh; }
@@ -140,7 +178,7 @@ body {
   display: flex; align-items: center; gap: 14px; padding: 14px 24px;
   border-bottom: 1px solid var(--line); background: var(--surface); position: sticky; top: 0; z-index: 20;
 }
-.topbar h2 { font-size: 15.5px; font-weight: 620; letter-spacing: -.01em; }
+.topbar h2, .topbar h1 { font-size: 15.5px; font-weight: 620; letter-spacing: -.01em; }
 .topbar .sep { color: var(--ink-3); }
 .topbar .meta { color: var(--ink-3); font-size: 12px; font-family: var(--mono); }
 .topbar .grow { flex: 1; }
@@ -323,6 +361,98 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .hr { height: 1px; background: var(--line-soft); margin: 4px 0 16px; }
 .switch { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; }
 .switch .lb { font-size: 13.5px; }
+/* Key 管理页的 toggle switch（无 .lb，纯开关） */
+#view-keys .switch { display: inline-flex; padding: 0; cursor: pointer; }
+#view-keys .switch input { appearance: none; width: 0; height: 0; margin: 0; position: absolute; }
+#view-keys .switch-track {
+  width: 34px; height: 18px; border-radius: 10px; background: var(--line);
+  position: relative; transition: background .15s; flex: none;
+}
+#view-keys .switch-track::after {
+  content: ''; position: absolute; top: 2px; left: 2px;
+  width: 14px; height: 14px; border-radius: 50%; background: #fff;
+  transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.2);
+}
+#view-keys .switch input:checked + .switch-track { background: var(--ok); }
+#view-keys .switch input:checked + .switch-track::after { transform: translateX(16px); }
+
+/* ── Key 管理：卡片式列表 ──────────────────────────────────────────
+    对齐 hub 的 .key-card 模式：每把 Key 一张卡片，弹性换行适配窄屏。
+    纯 CSS 实现，不依赖任何 UI 库（适配 go:embed 单文件）。 */
+#view-keys .key-list { display: flex; flex-direction: column; gap: 10px; }
+#view-keys .key-card {
+  background: var(--surface-2); border: 1px solid var(--line-soft);
+  border-radius: 10px; padding: 14px 17px; transition: border-color .15s, box-shadow .15s;
+}
+#view-keys .key-card:hover { border-color: var(--line); box-shadow: var(--shadow); }
+#view-keys .key-card.disabled { opacity: .65; }
+#view-keys .key-card.disabled .key-name { color: var(--ink-3); }
+#view-keys .key-card-main {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
+}
+#view-keys .key-info { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; min-width: 0; flex: 1; }
+#view-keys .key-name { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 200px; }
+#view-keys .key-id { font: 11px var(--mono); color: var(--ink-3); }
+#view-keys .key-prefix {
+  font: 11.5px var(--mono); color: var(--ink-2);
+  background: var(--surface); border: 1px solid var(--line-soft);
+  border-radius: 5px; padding: 2px 7px; user-select: all;
+}
+#view-keys .key-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 1px 8px; border-radius: 999px; font-size: 11px; font-weight: 500; white-space: nowrap;
+}
+#view-keys .key-badge.realm-cn { color: var(--bad); background: var(--bad-soft); border: 1px solid color-mix(in srgb, var(--bad) 22%, transparent); }
+#view-keys .key-badge.realm-global { color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); }
+#view-keys .key-badge.realm-all { color: var(--ink-3); background: var(--surface); border: 1px solid var(--line); }
+#view-keys .key-badge.models-all { color: var(--ink-3); background: var(--surface); border: 1px solid var(--line); }
+#view-keys .key-badge.models-block { color: var(--bad); background: var(--bad-soft); border: 1px solid color-mix(in srgb, var(--bad) 22%, transparent); }
+#view-keys .key-badge.models-list { color: var(--ok); background: var(--ok-soft); border: 1px solid color-mix(in srgb, var(--ok) 22%, transparent); }
+#view-keys .key-actions { display: flex; gap: 6px; flex: none; }
+#view-keys .key-actions button { padding: 4px 10px; font-size: 12px; border-radius: 6px; white-space: nowrap; }
+#view-keys .key-empty {
+  padding: 48px 20px; text-align: center; color: var(--ink-3);
+}
+#view-keys .key-empty .big { font-size: 14px; color: var(--ink-2); margin-bottom: 8px; }
+#view-keys .key-empty .desc { font-size: 12.5px; max-width: 32em; margin: 0 auto; }
+#view-keys .key-load-error {
+  padding: 32px 20px; text-align: center; color: var(--bad);
+}
+#view-keys .key-load-error .big { font-size: 14px; margin-bottom: 8px; }
+
+/* ── Key 管理：弹窗（新增/编辑/明文展示）──────────────────────────────
+    复用现有 .veil/.dlg 弹窗框架，Key 专用样式用 #view-keys 限定防越界。 */
+#view-keys .key-dlg { width: 480px; }
+#view-keys .key-dlg .field-group { display: flex; flex-direction: column; gap: 14px; }
+#view-keys .key-dlg .realm-pills {
+  display: inline-flex; gap: 3px; background: var(--surface-2);
+  border-radius: 8px; padding: 3px;
+}
+#view-keys .key-dlg .realm-pill {
+  padding: 5px 14px; border-radius: 6px; border: none;
+  background: transparent; color: var(--ink-3); font: 550 12.5px var(--sans); cursor: pointer;
+  transition: background .12s, color .12s;
+}
+#view-keys .key-dlg .realm-pill:hover { color: var(--ink); }
+#view-keys .key-dlg .realm-pill.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.22); }
+#view-keys .key-dlg .realm-pill.on.cn { color: var(--bad); }
+#view-keys .key-dlg .realm-pill.on.global { color: var(--accent); }
+#view-keys .key-dlg .key-gen-row { display: flex; gap: 7px; }
+#view-keys .key-dlg .key-gen-row input { flex: 1; }
+#view-keys .key-dlg .models-hint { font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
+#view-keys .key-plaintext {
+  display: block; font: 600 14px/1.5 var(--mono); word-break: break-all;
+  background: var(--surface-2); border: 1px solid var(--line-soft);
+  border-radius: 8px; padding: 12px 14px; user-select: all; color: var(--ink);
+}
+#view-keys .key-plaintext-warning {
+  display: flex; align-items: flex-start; gap: 8px; margin-top: 12px;
+  padding: 10px 13px; border-radius: 8px; background: var(--warn-soft);
+  border: 1px solid color-mix(in srgb, var(--warn) 22%, transparent); font-size: 12.5px; color: var(--warn);
+}
+#view-keys .key-plaintext-warning svg { width: 15px; height: 15px; flex: none; margin-top: 1px; }
+#view-keys .key-copy-row { display: flex; gap: 8px; margin-top: 12px; }
 .savebar {
   display: flex; align-items: center; gap: 12px; padding: 13px 17px;
   border-top: 1px solid var(--line-soft); background: var(--surface-2);
@@ -330,6 +460,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 }
 .savebar .grow { flex: 1; }
 .restart-note { color: var(--warn); font-size: 12.5px; }
+/* 配置页未保存标记（cfgDirty 时由 app.js 加上）：与「需重启」提示同色但加粗，
+   两者可能同时出现（改了一个需重启字段），加粗保证「未保存」先被看到。 */
+.restart-note.cfg-dirty { font-weight: 650; }
 
 /* ── 弹层 ─────────────────────────────────────────────────────────── */
 .veil { position: fixed; inset: 0; background: rgba(6,8,13,.62); backdrop-filter: blur(2px); display: none; z-index: 60; }
@@ -389,7 +522,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 .tst {
   background: var(--raise); border: 1px solid var(--line); border-left: 3px solid var(--ink-3);
   border-radius: 8px; padding: 10px 15px; font-size: 13px; box-shadow: var(--shadow); max-width: 380px;
+  display: flex; align-items: flex-start; gap: 10px;
 }
+.tst > span { flex: 1; min-width: 0; word-break: break-word; }
+/* toast 手动关闭：长文案/想先复制时不必等自动消失 */
+.tst .tst-x {
+  flex: none; padding: 0; width: 18px; height: 18px; line-height: 1; font-size: 15px;
+  background: transparent; border: none; color: var(--ink-3); cursor: pointer; border-radius: 4px;
+}
+.tst .tst-x:hover { color: var(--ink); background: var(--surface-2); border-color: transparent; }
 .tst.ok { border-left-color: var(--ok); } .tst.err { border-left-color: var(--bad); }
 
 @media (max-width: 760px) {
@@ -578,6 +719,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
      限高 + 表头吸顶：滚动区域内始终能看到列名。 */
   .req-wrap { max-height: 460px; overflow: auto; }
   .req-wrap thead th { position: sticky; top: 0; background: var(--surface); z-index: 1; }
+  /* 分页器：居中、按钮紧凑；禁用态半透明（当前页/边界）。 */
+  .req-pager { display: flex; justify-content: center; padding: 10px 0 4px; }
+  .req-pager .pg { display: inline-flex; align-items: center; gap: 4px; }
+  .req-pager button { min-width: 26px; }
+  .req-pager .pg-ellipsis { color: var(--ink-3); padding: 0 2px; }
   .clip { display: block; max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .clip.ip { max-width: 150px; font-family: var(--mono); font-size: 12.5px; }
   .clip.rid { max-width: 150px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
@@ -647,6 +793,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
+      <li><a href="#keys" data-view="keys">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="5" cy="11" r="3"/><path d="M7.2 8.8 13 3M11 1l2 2M9.5 4.5l2 2"/></svg>
+        API Key</a></li>
       <li><a href="#config" data-view="config">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
         配置</a></li>
@@ -660,9 +809,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     </div>
   </nav>
 
-  <div class="main">
+  <main class="main">
     <div class="topbar">
-      <h2 id="ttl">账号池</h2>
+      <h1 id="ttl">账号池</h1>
       <span class="sep">/</span>
       <span class="meta" id="subMeta">-</span>
       <div class="grow"></div>
@@ -709,13 +858,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnTravelAll">旅行巡检</button>
           <button class="xs" id="btnActivityAll">活跃上报</button>
           <button class="xs" id="btnKeepaliveAll">全部保活</button>
+          <button class="xs" id="btnBalanceAll" title="逐账号向上游查询余额并写回积分快照（重量级操作，会打上游）">刷新余额</button>
         </header>
         <div class="tbl-wrap">
         <table class="acc">
           <thead><tr>
-            <th class="mark" aria-hidden="true"></th>
-            <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
+            <th class="mark" aria-hidden="true" scope="col"></th>
+            <th scope="col">账号</th><th scope="col">状态</th><th scope="col">积分</th>
+            <th scope="col">成功 / 失败</th><th scope="col">在途</th><th scope="col">用量</th><th scope="col">最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
@@ -731,8 +881,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <div class="tbl-wrap">
         <table class="acc">
           <thead><tr>
-            <th>模型</th><th>域</th><th>状态</th><th>可选 / 总数</th>
-            <th>锁定账号</th><th>最早解锁</th><th>全池解锁</th><th>原因</th>
+            <th scope="col">模型</th><th scope="col">域</th><th scope="col">状态</th><th scope="col">可选 / 总数</th>
+            <th scope="col">锁定账号</th><th scope="col">最早解锁</th><th scope="col">全池解锁</th><th scope="col">原因</th>
           </tr></thead>
           <tbody id="mlBody"></tbody>
         </table>
@@ -765,6 +915,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </svg>
           <div class="t">还没有扫描过</div>
           <div class="d">扫描所有账号的成长任务与开学季待办，把没做的排成一列，一键执行。</div>
+          <!-- 空态给 CTA：此前只有文案，用户得自己找到 header 的按钮 -->
+          <button class="primary" id="btnScanAllEmpty" style="margin-top:14px">立即扫描待办</button>
         </div>
         <div id="qcList"></div>
       </div>
@@ -822,7 +974,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </div>
         <div class="tbl-wrap">
         <table class="acc md">
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
+          <thead><tr><th class="mark" aria-hidden="true" scope="col"></th><th scope="col">模型</th><th scope="col">积分倍率</th><th scope="col">默认档</th><th scope="col">支持的思考档位</th><th scope="col">上下文长度</th><th scope="col">最大输出</th></tr></thead>
           <tbody id="mdBody"></tbody>
         </table>
         </div>
@@ -893,6 +1045,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </span>
           <span class="grow"></span>
           <span class="note" id="usDimNote">—</span>
+          <button class="xs ghost" id="btnUsExport" title="把当前维度与排序下的用量明细导出为 CSV">导出 CSV</button>
           <label class="sel-note">排序
             <select id="usSort">
               <option value="total">合计 Token</option>
@@ -916,9 +1069,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="vtabs" id="usCreditTabs">
             <button data-dim="account" class="on">按账号</button>
             <button data-dim="model">按模型</button>
+            <button data-dim="key">按 Key</button>
           </span>
           <span class="grow"></span>
           <span class="note" id="usCreditNote">—</span>
+          <button class="xs ghost" id="btnCreditExport" title="把当前维度下的积分扣除导出为 CSV">导出 CSV</button>
         </header>
         <div class="kpis k4" id="usCreditStats"></div>
         <div class="tbl-wrap">
@@ -926,6 +1081,103 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <thead id="usCreditHead"></thead>
             <tbody id="usCreditBody"></tbody>
           </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- API Key 管理 -->
+    <section class="view" id="view-keys" hidden>
+      <div class="box">
+        <header>
+          <h3>API Key 管理</h3>
+          <span class="grow"></span>
+          <span class="note" id="keyAdminStatus"></span>
+          <button class="xs" id="btnKeyReload">刷新</button>
+          <button class="primary xs" id="btnKeyAdd">+ 新增 Key</button>
+        </header>
+        <div class="pad">
+          <div class="key-list" id="keyBody"></div>
+          <div id="keyEmpty" class="key-empty" hidden>
+            <div class="big">未配置多 Key</div>
+            <div class="desc">当前使用单 api_key 鉴权。点击「+ 新增 Key」配置第一条多 Key。</div>
+          </div>
+          <div id="keyLoadError" class="key-load-error" hidden>
+            <div class="big">读取 Key 列表失败</div>
+            <div id="keyLoadErrMsg"></div>
+            <button class="xs" id="btnKeyRetry" style="margin-top:12px">重试</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 新增/编辑弹窗 -->
+      <div class="veil" id="keyEditVeil">
+        <div class="dlg key-dlg">
+          <header>
+            <h3 id="keyDlgTitle">新增 Key</h3>
+            <div class="hint" id="keyDlgHint">配置一条新的 API Key</div>
+          </header>
+          <div class="body">
+            <div class="field-group">
+              <label class="fld">
+                <span class="lb">名称</span>
+                <input id="kfName" placeholder="可空，用于标识（如「朋友-GLM」）">
+              </label>
+              <label class="fld">
+                <span class="lb">ID <span style="color:var(--ink-3);font-weight:400">（鉴权用，唯一）</span></span>
+                <input id="kfId" placeholder="必填，[A-Za-z0-9_-] ≤ 64 字符">
+                <span class="hint">ID 是 Key 的唯一标识，不可重复</span>
+              </label>
+              <label class="fld" id="kfKeyWrap">
+                <span class="lb">密钥</span>
+                <div class="key-gen-row">
+                  <input id="kfKey" type="password" placeholder="留空 = 不修改（编辑时）/ 必填（新增时）">
+                  <button type="button" class="xs" id="btnKeyGen">生成</button>
+                </div>
+                <span class="hint" id="kfKeyHint">新增时必填；编辑时留空表示不修改密钥</span>
+              </label>
+              <label class="fld">
+                <span class="lb">Realm 版本约束</span>
+                <div class="realm-pills" id="kfRealmPills">
+                  <button type="button" class="realm-pill on" data-realm="">不限</button>
+                  <button type="button" class="realm-pill cn" data-realm="cn">国内版</button>
+                  <button type="button" class="realm-pill global" data-realm="global">国际版</button>
+                </div>
+                <span class="hint">限定这把 Key 只能调用哪个版本的模型</span>
+              </label>
+              <label class="fld">
+                <span class="lb">模型白名单</span>
+                <input id="kfModels" placeholder="留空 = 不限，逗号分隔（如 deepseek-v4-flash, glm-5.2）">
+                <span class="models-hint">留空 = 不限制（可调用全部模型）；填入模型 ID = 白名单</span>
+              </label>
+            </div>
+          </div>
+          <footer>
+            <span class="grow"></span>
+            <button id="btnKeyCancel">取消</button>
+            <button class="primary" id="btnKeySave">保存</button>
+          </footer>
+        </div>
+      </div>
+
+      <!-- 创建后明文展示弹窗 -->
+      <div class="veil" id="keyShowVeil">
+        <div class="dlg key-dlg">
+          <header>
+            <h3>Key 已创建</h3>
+            <div class="hint">请立即复制保存，关闭后无法再次查看完整密钥</div>
+          </header>
+          <div class="body">
+            <code class="key-plaintext" id="keyPlaintext"></code>
+            <div class="key-plaintext-warning">
+              <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 13H2z"/><path d="M8 6v3M8 11.5v.5"/></svg>
+              <span>面板只存哈希，明文仅此一次展示。关闭弹窗后连服务端也拿不回完整密钥。</span>
+            </div>
+          </div>
+          <footer>
+            <span class="grow"></span>
+            <button id="btnKeyCopy">复制密钥</button>
+            <button class="primary" id="btnKeyShowClose">已保存，关闭</button>
+          </footer>
         </div>
       </div>
     </section>
@@ -1058,6 +1310,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">会话粘性 TTL</span>
                 <input name="ttl" placeholder="30m">
                 <span class="hint">改动需重启进程</span></label>
+              <label class="fld"><span class="lb">熔断试探间隔（half-open）</span>
+                <input name="breaker_probe_gap" placeholder="30s">
+                <span class="hint">熔断到期后每该间隔至多放行 1 次试探，成功即全量恢复；0 关闭</span></label>
+              <label class="fld"><span class="lb">全局在途上限</span>
+                <input name="global_max_in_flight" type="number" min="0" placeholder="0">
+                <span class="hint">全网关在途请求总数上限，超限立即 429（不排队）；0 = 不限</span></label>
             </div>
             <div class="switch"><span class="lb">快过期积分优先</span>
               <input type="checkbox" name="prefer_expiring"></div>
@@ -1102,6 +1360,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
+            <div class="switch"><span class="lb">内容派生会话键</span>
+              <input type="checkbox" name="session_sticky_derive"></div>
+            <div class="hint" style="margin-top:4px">关闭后只有客户端显式传 conversation_id / prompt_cache_key 才粘性；
+              无会话标识的请求回落加权轮换。防止「固定 system + 短开场」把无关对话误判为同一会话、流量全钉在一个号上。</div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
           </div>
         </div>
@@ -1152,18 +1414,21 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </select>
           <span class="grow"></span>
           <span class="note" id="reqCount">—</span>
+          <button class="xs ghost" id="btnReqExport" title="把当前筛选后的请求记录导出为 CSV（含 BOM，Excel 直接打开）">导出 CSV</button>
           <button class="xs" id="btnReqReload">重新读取</button>
         </div>
         <div class="tbl-wrap req-wrap">
           <table class="acc req">
             <thead><tr>
-              <th>时间</th><th>结果</th><th>模型</th><th>账号</th>
-              <th>来源 IP</th><th>User-Agent</th>
-              <th class="num">耗时</th><th class="num">Token</th><th class="num">积分</th><th>请求 ID</th>
+              <th scope="col">时间</th><th scope="col">结果</th><th scope="col">模型</th><th scope="col">账号</th>
+              <th scope="col">来源 IP</th><th scope="col">User-Agent</th>
+              <th class="num">耗时</th><th class="num">Token</th><th class="num">积分</th><th scope="col">请求 ID</th>
             </tr></thead>
             <tbody id="reqBody"></tbody>
           </table>
         </div>
+        <!-- 分页器：>50 条才出现；数据全量在内存（筛选/导出不受影响），渲染只画当前页 -->
+        <div class="req-pager" id="reqPager"></div>
       </div>
 
       <div class="box">
@@ -1182,7 +1447,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <pre id="logBox"></pre>
       </div>
     </section>
-  </div>
+  </main>
 </div>
 
 <!-- 积分任务 -->
@@ -1196,7 +1461,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="state" id="taskState"><span class="dots">加载中</span></div>
       <div class="tbl-wrap">
         <table class="acc md" id="taskTable" hidden>
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>任务</th><th>进度</th><th>奖励</th><th>状态</th><th class="c-acts"></th></tr></thead>
+          <thead><tr><th class="mark" aria-hidden="true" scope="col"></th><th scope="col">任务</th><th scope="col">进度</th><th scope="col">奖励</th><th scope="col">状态</th><th class="c-acts"></th></tr></thead>
           <tbody id="taskBody"></tbody>
         </table>
       </div>
@@ -1284,7 +1549,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
     </header>
     <div class="body">
-      <form style="display:contents" onsubmit="return false"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off"></form>
+      <!-- 无 onsubmit 内联属性（CSP 禁行内事件处理器）：回车提交由 app.js 拦截 preventDefault -->
+      <form id="keyGateForm" style="display:contents"><input type="password" id="keyInput" placeholder="api_key" autocomplete="off"></form>
       <div class="state err" id="keyErr" hidden style="margin-top:10px">密钥不正确，请重试。</div>
     </div>
     <footer>
@@ -1294,7 +1560,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   </div>
 </div>
 
-<div id="toasts"></div>
+<!-- aria-live：toast 是唯一的操作结果出口（删除成功/保存失败等），
+     无 aria-live 时读屏用户完全感知不到结果。polite 不打断当前朗读。 -->
+<div id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
 
 <script src="app.js"></script>
 </body>

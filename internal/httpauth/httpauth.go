@@ -6,7 +6,6 @@
 package httpauth
 
 import (
-	"crypto/sha256"
 	"crypto/subtle"
 	"net/http"
 	"strings"
@@ -15,13 +14,16 @@ import (
 // bearerPrefix 认证方案前缀（大小写敏感，与 HTTP 规范及既有实现一致）。
 const bearerPrefix = "Bearer "
 
-// VerifyBearer 校验请求头是否携带正确的 Bearer 密钥。
+// VerifyBearer 校验请求头是否携带正确的 Bearer 密钥（单 Key 兼容签名，行为与 2.0.0 一致）。
 //
 // key 为空表示"未启用鉴权"，恒返回 true（调用方据此放行）。
 // 比较用 SHA-256 摘要 + subtle.ConstantTimeCompare：
 //   - 常量时间，不因前缀匹配长度而泄露信息；
 //   - 先摘要再比较，长度差异被吸收进摘要（不会因长度不同提前返回）；
 //   - 摘要本身不可逆，即便有侧信道也拿不到密钥原文。
+//
+// 单 Key 路径保持零分配（2.0.0 行为），**不委托** BuildIndex——那是多 Key 的
+// 索引结构，每次构建会引入 map/切片分配，单 Key 场景不值得付这个代价。
 func VerifyBearer(r *http.Request, key string) bool {
 	if key == "" {
 		return true
@@ -34,10 +36,4 @@ func VerifyBearer(r *http.Request, key string) bool {
 	}
 	tok := authz[len(bearerPrefix):]
 	return subtle.ConstantTimeCompare(digest(tok), digest(key)) == 1
-}
-
-// digest 返回 s 的 SHA-256（定长 32 字节，供常量时间比较）。
-func digest(s string) []byte {
-	sum := sha256.Sum256([]byte(s))
-	return sum[:]
 }

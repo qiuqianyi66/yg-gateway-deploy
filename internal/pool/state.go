@@ -92,6 +92,7 @@ func (p *Pool) Revive(uid string) bool {
 	e.fails = 0
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
+	e.clearProbeAt() // half-open 试探记录随复活清零（ADR-003 D-400）
 	p.dirty.Store(true)
 	return true
 }
@@ -156,6 +157,7 @@ func (p *Pool) NoteError(uid string) {
 	if e, ok := p.byUID[uid]; ok {
 		e.errTotal++
 		e.lastErr = time.Now()
+		e.noteEwmaFailure(p.ewmaAlpha) // ADR-005 D-502：失败事件压低成功率信号
 		p.recordBreakerFailureLocked(e)
 		p.dirty.Store(true)
 	}
@@ -176,9 +178,11 @@ func (p *Pool) NoteSuccess(uid string) {
 	if e, ok := p.byUID[uid]; ok {
 		e.successCount++
 		e.lastSuccess = time.Now()
+		e.noteEwmaSuccess(p.ewmaAlpha) // ADR-005 D-502：成功事件抬升成功率信号
 		e.fails = 0
 		e.retryCount = 0
 		e.breakerUntil = time.Time{}
+		e.clearProbeAt() // half-open 试探记录随恢复一并清零（ADR-003 D-400）
 		e.softStreak = 0
 		e.sessionDeadFails = 0
 		e.consecutiveFails = 0
@@ -297,6 +301,7 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	}
 	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
 		usage.LastLatencyMs = delta.LatencyMs
+		e.noteEwmaLatency(p.ewmaAlpha, delta.LatencyMs) // ADR-005 D-502：延迟信号（见 ADR 关于失败/客户端错误的喂入口径）
 	}
 	if delta.HasTokensPerSecond && delta.TokensPerSecond >= 0 {
 		speed := delta.TokensPerSecond
@@ -317,6 +322,22 @@ func (p *Pool) Status(uid string) (Status, bool) {
 		return Status{}, false
 	}
 	return p.statusOf(uid, e), true
+}
+
+// RealmOf 只取账号的 realm（cn/global），不做 statusOf 的完整构造。
+//
+// 为什么单独开一个：请求热路径的 recordAttempt 每次尝试都要拿 realm 记账，而
+// Status() 会构造整个 Status（含 rate_limited_models 切片、model_costs 切片与
+// 两次排序）——只为读一个字符串。这是每请求一次的全池 RLock + 多次分配的浪费。
+// realm 由 auth.Realm() 计算（与 statusOf 同源，不会漂移）。
+// 未注册的 uid 返回 ""（与 Status 的 !ok 同语义，调用方自行回落默认值）。
+func (p *Pool) RealmOf(uid string) string {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.a.Realm()
+	}
+	return ""
 }
 
 // AuthByUID 返回账号的完整凭证（给调度器/运维接口用）。
@@ -375,8 +396,8 @@ func (p *Pool) AvailableUIDsForModel(model string) []string {
 // 这是粘性能"换得动"的关键：绑定只记 uid，若只按账号级 healthy 校验，
 // 被模型级限额的号（账号整体仍健康）会被持续选中直到轮换次数耗尽。
 func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	e, ok := p.byUID[uid]
 	if !ok {
 		return nil
@@ -399,17 +420,19 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	if p.inFlightFull(e) {
 		return nil
 	}
-	e.lastUsed = now
-	p.pickSeq++
-	e.usedSeq = p.pickSeq
+	// 原子写回（ADR-005 D-500）：粘性命中改读锁 + 原子选中标记（与 pick 同口径）。
+	e.setLastUsed(now)
+	seq := p.pickSeq.Add(1)
+	e.usedSeq.Store(seq)
 	return e.a
 }
 
 // PickByUID 若 uid 当前 healthy 且未占满在途名额，返回其凭证（记录 lastUsed 防撞号）；
 // 否则返回 nil。供会话粘性路由命中校验与直取使用。
+// 读锁口径（ADR-005 D-500）：与 pick 一致，选中写回走原子（见下方注释）。
 func (p *Pool) PickByUID(uid string) *auth.Auth {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.mu.RLock()
+	defer p.mu.RUnlock()
 	e, ok := p.byUID[uid]
 	if !ok {
 		return nil
@@ -421,9 +444,10 @@ func (p *Pool) PickByUID(uid string) *auth.Auth {
 	if p.inFlightFull(e) {
 		return nil
 	}
-	e.lastUsed = now
-	p.pickSeq++
-	e.usedSeq = p.pickSeq
+	// 原子写回（ADR-005 D-500）：粘性命中改读锁 + 原子选中标记（与 pick 同口径）。
+	e.setLastUsed(now)
+	seq := p.pickSeq.Add(1)
+	e.usedSeq.Store(seq)
 	return e.a
 }
 
@@ -572,6 +596,20 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		InFlight:                 int(e.inFlight.Load()),
 		BreakerFails:             e.fails,
 		BreakerUntil:             e.breakerUntil,
+	}
+	if p.ewmaEnabled {
+		// EWMA 表现信号透出（ADR-005 D-502）：仅开启且已有观测时输出，运维可直观
+		// 看到「成功率/延迟表现」；样本未达 minSamples 也透出（观测原始值，
+		// 是否参与加权由 ewmaWeightFactor 的样本门槛决定，两者独立）。
+		if e.ewmaSuccessSamples > 0 {
+			sr := e.ewmaSuccess
+			st.EwmaSuccess = &sr
+		}
+		if e.ewmaLatencySamples > 0 {
+			ms := float64(int64(e.ewmaLatencyMs*10+0.5)) / 10 // 保留 1 位小数
+			st.EwmaLatencyMs = &ms
+		}
+		st.EwmaSamples = e.ewmaSuccessSamples
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。

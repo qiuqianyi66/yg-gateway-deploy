@@ -83,26 +83,26 @@ type Status struct {
 	RateLimitedModels []RateLimitedModel `json:"rate_limited_models,omitempty"`
 	// Realm 账号域（cn/global，auth.Realm() 计算值；含 global.enabled 开关闸）。
 	// 供面板/状态接口按域分组展示。
-	Realm           string     `json:"realm,omitempty"`
+	Realm string `json:"realm,omitempty"`
 	// Enterprise 企业版账号（auth.EnterpriseID 非空，计算值不落盘）。
 	// 企业版无个人成长体系（签到/成长任务/连登/旅行/夜猫子 上游均拒），
 	// 面板据此隐藏对应按钮；选号、保活、额度展示不受影响。
-	Enterprise      bool       `json:"enterprise,omitempty"`
-	Disabled        bool       `json:"disabled"`
-	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	Enterprise     bool   `json:"enterprise,omitempty"`
+	Disabled       bool   `json:"disabled"`
+	DisabledReason string `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
 	// Paused 暂停选号：退出选号候选（与 disabled 一样不参与选号），但**照常参与**
 	// 签到 / 活跃上报 / 保活 / 余额刷新四类保号任务。与 disabled 正交——disabled 是
 	// 「授权/session 终态，需人工 revive」，paused 是「运维临时让位」（多号轮换场景），
 	// 账号本身健康，只是暂不接流量。
-	Paused          bool       `json:"paused,omitempty"`
-	SuccessCount    int64      `json:"success_count,omitempty"`
-	ErrTotal        int64      `json:"err_total,omitempty"`
-	LastSuccessTime time.Time  `json:"last_success,omitempty"`
-	LastErrTime     time.Time  `json:"last_err,omitempty"`
+	Paused          bool      `json:"paused,omitempty"`
+	SuccessCount    int64     `json:"success_count,omitempty"`
+	ErrTotal        int64     `json:"err_total,omitempty"`
+	LastSuccessTime time.Time `json:"last_success,omitempty"`
+	LastErrTime     time.Time `json:"last_err,omitempty"`
 	// CheckinDone 本地今日已签到（签到成功或上游"今天已签到"幂等拒绝均算）。
 	// global 域账号无签到体系，恒为 false。面板签到按钮据此显示 签到/已签。
-	CheckinDone bool        `json:"checkin_done,omitempty"`
-	TokenUsage  TokenUsage  `json:"token_usage,omitempty"`
+	CheckinDone bool       `json:"checkin_done,omitempty"`
+	TokenUsage  TokenUsage `json:"token_usage,omitempty"`
 	// ModelCosts 每模型实测成本台账（P1-anti-monopoly 可观测性）：运维据此自查
 	//「为什么总选它」——tier 0（免费）垄断 / tier 2 单价排序一眼可见。
 	// 仅 modelCostTTL 内的有效观测，每模型一行（cost_per_1k + last_seen +
@@ -117,6 +117,11 @@ type Status struct {
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
+	// EWMA 表现信号（ADR-005 D-502）：仅 ewma 开启且样本 > 0 时透出（指针 = 有值）。
+	// EwmaSamples 为成功率事件样本数（成功/失败各 +1；延迟样本数独立不在此透出）。
+	EwmaSuccess   *float64 `json:"ewma_success,omitempty"`    // 成功率 EWMA（0~1）
+	EwmaLatencyMs *float64 `json:"ewma_latency_ms,omitempty"` // 延迟 EWMA（毫秒，保留 1 位小数）
+	EwmaSamples   int64    `json:"ewma_samples,omitempty"`    // 成功率事件样本数
 }
 
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
@@ -204,20 +209,34 @@ type entry struct {
 	// paused 暂停选号：与 disabled 正交。置位后退出选号候选（healthy 判否），
 	// 但保号任务遍历只按 Disabled 过滤，故 paused 号天然继续参与签到 / 活跃上报 /
 	// 保活 / 余额刷新。持久化（state.json），跨重启不丢。
-	paused         bool
-	reason         string
-	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
+	paused bool
+	reason string
+	// lastUsed 最近被选中时刻（防并发撞号）。atomic（unixnano，0=从未使用）：
+	// pick 改读锁后（ADR-005 D-500）选中写回不再持写锁，普通字段在读锁下写入
+	// 会成数据竞争；原子化后读锁路径可直接 Load/Store。运行态，不持久化。
+	lastUsed atomic.Int64
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
 	// usedSeq 提供严格全序，与时间精度无关。运行态，不持久化。
-	usedSeq uint64
+	// atomic（同 lastUsed 口径，ADR-005 D-500）。
+	usedSeq atomic.Uint64
 	// breakerUntil / fails / retryCount 为熔断器运行态（不持久化）。
 	// fails 是唯一的"连续失败"计数器：任何错误喂入，达到 breakerThreshold 触发熔断（指数退避），
 	// 跨入口累计，成功/熔断/统一复活时清零（保留 retryCount 驱动退避指数）。
 	breakerUntil time.Time // 熔断截止（指数退避）
 	fails        int       // 连续失败计数（熔断用，唯一权威）
 	retryCount   int       // 已熔断次数（指数退避的指数）
+	// breakerProbeAt 最近一次 half-open 试探时刻（ADR-003 D-400）。
+	// 熔断到期后不再一次性全量放回，而是每 breakerProbeGap 至多 1 次试探；
+	// 本字段记录上次试探，供限速判定。运行态，不持久化（重启后首次到期即试探，
+	// 语义安全：最坏多探一次）。atomic（unixnano，0=无试探），同 lastUsed 口径。
+	breakerProbeAt atomic.Int64
+	// lastPrune 上次清理模型级台账（modelCost / modelCooldowns）的时刻
+	// （ADR-003 D-402）。pick 的写锁内每轮对全池每个 entry 扫这两个 map，
+	// 实测占 pick 耗时 ~85%；改为按 pruneInterval 时间节流后，绝大多数 pick
+	// 直接跳过扫描。运行态，不持久化。
+	lastPrune time.Time
 	// softStreak 连续软冷却次数（CoolSoft），独立于熔断器 fails 的**冷却域**计数器：
 	// fails 会被熔断触发清零、且被 hard 冷却与 NoteError 污染，无法表达"连续软限流"。
 	// 重置点只有两处（都是账号被证明恢复的时刻）：NoteSuccess、reviveCoolingLocked。
@@ -255,6 +274,101 @@ type entry struct {
 	modelCost map[string]modelCostEntry
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
+
+	// EWMA 成功率/延迟信号（ADR-005 D-502）：把「最近表现」回灌选号权重，
+	// 替代被删的终身累计成功率因子（errTotal 只增不减，早期出错会永久压权）。
+	// 运行态，不持久化（重启回中性）；仅在 p.ewmaEnabled 且样本达
+	// p.ewmaMinSamples 后参与加权（冷启动中性，不饿死新号）。
+	// 全部在 p.mu 写锁路径（NoteSuccess/NoteError/NoteFailures/RecordTokenUsage）
+	// 更新，pick 读锁路径只读，普通字段即可。
+	ewmaSuccess        float64 // 成功率 EWMA：1=全成、0=全败（懒初始化 1.0：首个事件前视同从未失败；样本不足不参与）
+	ewmaSuccessSamples int64   // 成功率事件样本数（成功/失败各 +1）
+	ewmaLatencyMs      float64 // 每请求延迟 EWMA（毫秒；首个观测直接赋值）
+	ewmaLatencySamples int64   // 延迟样本数
+}
+
+// EWMA 表现回灌的默认参数与因子边界（ADR-005 D-502）。
+// 默认关闭（零回归）：需 config pool.ewma.enabled=true 才参与加权。
+// cmd/server/config.go 里的 defaultEwmaAlpha/defaultEwmaMinSamples 必须与本组一致。
+const (
+	defaultEwmaAlpha      = 0.1 // 平滑系数：约 30~40 次观测收敛到稳态
+	defaultEwmaMinSamples = 5   // 每账号样本下限：少于该值因子恒 1（冷启动中性）
+	// 成功率因子边界：sr 高于基线加分、低于基线减分，线性映射并钳制在
+	// [1-successPenaltyMax, 1+successBoostMax]——不可能把账号权重清零（饿死防护），
+	// 也只温和拉开档位，不颠覆 credits/闲置/快过期的主导地位。
+	ewmaSuccessBaseline   = 0.95
+	ewmaSuccessBoostMax   = 0.15
+	ewmaSuccessPenaltyMax = 0.15
+	// 延迟因子边界：仅惩罚显著慢于池中位数的账号（> 中位数 × slowFactor），
+	// 超阈值部分线性升到封顶；低于阈值不罚（对噪声稳健，快账号不额外加分，
+	// 避免振荡与「快号越用越多」的正反馈）。
+	ewmaLatencySlowFactor = 1.5
+	ewmaLatencyPenaltyMax = 0.3
+)
+
+// lastUsedTime 最近选中时刻（0=从未使用 → 零值 time.Time）。
+func (e *entry) lastUsedTime() time.Time {
+	n := e.lastUsed.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
+
+// setLastUsed 记录最近选中时刻（原子写，pick 读锁路径与粘性路径共用）。
+func (e *entry) setLastUsed(t time.Time) { e.lastUsed.Store(t.UnixNano()) }
+
+// clearLastUsed 清空最近选中时刻（测试/复位用）。
+func (e *entry) clearLastUsed() { e.lastUsed.Store(0) }
+
+// probeAtTime 最近 half-open 试探时刻（0=无试探 → 零值 time.Time）。
+func (e *entry) probeAtTime() time.Time {
+	n := e.breakerProbeAt.Load()
+	if n == 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, n)
+}
+
+// setProbeAt 记录 half-open 试探时刻（原子写）。
+func (e *entry) setProbeAt(t time.Time) { e.breakerProbeAt.Store(t.UnixNano()) }
+
+// clearProbeAt 清空试探记录（NoteSuccess/Revive 随恢复清零）。
+func (e *entry) clearProbeAt() { e.breakerProbeAt.Store(0) }
+
+// noteEwmaSuccess 喂一次成功事件：sr 向 1 收敛（alpha 平滑）。
+// 首个事件前懒初始化 sr=1.0（乐观初值）：健康新号从样本 1 起就保持满分，
+// 不会被「从 0 慢速爬升」误罚（否则 minSamples 门槛内外的头几十个样本
+// 都会低于基线 0.95 而被持续减权）。
+// 调用方必须已持有 p.mu 写锁。
+func (e *entry) noteEwmaSuccess(alpha float64) {
+	if e.ewmaSuccessSamples == 0 {
+		e.ewmaSuccess = 1.0
+	}
+	e.ewmaSuccess += alpha * (1 - e.ewmaSuccess)
+	e.ewmaSuccessSamples++
+}
+
+// noteEwmaFailure 喂一次失败事件（NoteError/NoteFailures）：sr 向 0 收敛。
+// 首个事件前同样懒初始化 sr=1.0（从未观测过 = 从未失败，乐观但可被后续失败
+// 迅速拉低：1 次失败即 0.9、5 次 ≈0.59）。调用方必须已持有 p.mu 写锁。
+func (e *entry) noteEwmaFailure(alpha float64) {
+	if e.ewmaSuccessSamples == 0 {
+		e.ewmaSuccess = 1.0
+	}
+	e.ewmaSuccess -= alpha * e.ewmaSuccess
+	e.ewmaSuccessSamples++
+}
+
+// noteEwmaLatency 喂一次请求延迟观测（毫秒）。首个观测直接赋值（避免从 0 慢速
+// 爬升）。调用方必须已持有 p.mu 写锁。
+func (e *entry) noteEwmaLatency(alpha float64, ms int64) {
+	if e.ewmaLatencySamples == 0 {
+		e.ewmaLatencyMs = float64(ms)
+	} else {
+		e.ewmaLatencyMs += alpha * (float64(ms) - e.ewmaLatencyMs)
+	}
+	e.ewmaLatencySamples++
 }
 
 // modelCostOf 返回该账号在指定 model 上的有效成本观测；无观测或观测过期返回 ok=false。
@@ -342,25 +456,35 @@ func (e *entry) healthyForModel(now time.Time, reqModel string) bool {
 	return e.healthy(now)
 }
 
-// pruneExpiredModelCosts 删除 modelCost 中已过期的条目（惰性清理，与
-// pruneExpiredModelCooldowns 同形同调用点）。
+// pruneInterval 模型级台账的时间节流间隔（ADR-003 D-402）。
 //
-// 为什么必须有它：modelCost 此前只在**读**（modelCostOf）、**落盘**（persist）、
+// 实测（pick_prune_bench_test.go，50 账号各 10 条台账）：每轮 pick 扫这两个 map
+// 占 pick 耗时的 **~85%**（16.6µs vs 2.4µs），且全部发生在 pick 的写锁内——
+// 而选号是每请求必经、写锁是全池唯一串行点。
+//
+// 过期条目在**读路径天然被跳过**（modelCostOf / status 都判有效期），晚删一轮对
+// 正确性零影响，只是内存多占一会儿。故按时间节流：每 entry 每 interval 至多真扫一次。
+// 选 10s：被清理对象的时间尺度是小时级（modelCostTTL）/ 分钟级（冷却 Until），
+// 10s 的删除延迟相对可忽略。
+const pruneInterval = 10 * time.Second
+
+// pruneExpiredModelCosts 删除 modelCost 中已过期的条目（惰性清理，时间节流）。
+//
+// 为什么必须有它：modelCost 只在**读**（modelCostOf）、**落盘**（persist）、
 // **恢复**（persist）、**status**（state.go）四处做"过期过滤"，内存里的条目本身
-// 从不回收——即「map 只增不减」。而 entry.modelCost 的注释明确声称
-// 「落盘/恢复按 modelCostTTL 惰性过滤，陈旧观测不复活（同 modelCooldowns 口径）」，
-// 模型级冷却表正是靠 pruneExpiredModelCooldowns 在 pick 写锁路径做真正删除的
-// （见 pick.go「map 不无限膨胀」）。两者口径不一致：一旦某模型的观测过期，它就会
-// 永久占据一条内存（进程重启才清），并在后续每一轮 pick 的遍历、每次 status 遍历里
-// 被反复判定为过期（只是没人删）。
+// 从不回收——即「map 只增不减」。本函数补上真正的删除（与
+// pruneExpiredModelCooldowns 同调用点：pick 写锁路径）。
 //
-// 观测只在成功请求路径写入（NoteModelCost），且 model 不与目录校验，故增长受
-// "历史服务过的模型名"限制——不是无界泄漏，但同样是"只增不减"的无回收表。
+// 快路径（任一即返回）：空 map｜距上次清理不足 pruneInterval。
 // 调用方必须已持有 p.mu 写锁。
 func (e *entry) pruneExpiredModelCosts(now time.Time) {
 	if len(e.modelCost) == 0 {
-		return
+		return // 空 map：绝大多数账号的常态，零成本
 	}
+	if !e.lastPrune.IsZero() && now.Sub(e.lastPrune) < pruneInterval {
+		return // 时间节流：同一 entry 每 interval 至多真扫一次
+	}
+	e.lastPrune = now
 	for m, mc := range e.modelCost {
 		if mc.LastSeen.IsZero() || now.Sub(mc.LastSeen) > modelCostTTL {
 			delete(e.modelCost, m)
@@ -368,12 +492,14 @@ func (e *entry) pruneExpiredModelCosts(now time.Time) {
 	}
 }
 
-// pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理）。
-// pick 写锁路径与 revive 调用，防止 map 无限膨胀；status 只读遍历天然跳过过期项，
-// 无需清理。调用方必须已持有 p.mu 写锁。
+// pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理，时间节流）。
+// pick 写锁路径与 revive 调用，防止 map 无限膨胀；status 只读遍历天然跳过过期项。
+// 与 pruneExpiredModelCosts 共用 lastPrune：后者先被调用并做节流判定，
+// 本函数只判空 map（避免同一轮 pick 判两次）。
+// 调用方必须已持有 p.mu 写锁。
 func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 	if len(e.modelCooldowns) == 0 {
-		return
+		return // 空 map：多数账号从无 6004，零成本
 	}
 	for m, mc := range e.modelCooldowns {
 		if mc.Until.IsZero() || !now.Before(mc.Until) {
@@ -428,10 +554,10 @@ type stateAccount struct {
 	SuccessCount int64     `json:"success_count,omitempty"`
 	// err_total 累计错误计数。旧版 err_count（连续错误）仍可读：加载时映射到 err_total，
 	// 仅作一次性迁移，不再回写 err_count。
-	ErrTotal    int64      `json:"err_total,omitempty"`
-	ErrCount       int        `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
-	LastSuccess    time.Time  `json:"last_success,omitempty"`
-	LastErr        time.Time  `json:"last_err,omitempty"`
+	ErrTotal    int64     `json:"err_total,omitempty"`
+	ErrCount    int       `json:"err_count,omitempty"` // 兼容旧文件的迁移源，仅读取
+	LastSuccess time.Time `json:"last_success,omitempty"`
+	LastErr     time.Time `json:"last_err,omitempty"`
 	// LastCheckinDay 最近一次签到成功的本地日期（entry.lastCheckinDay 同源）。
 	// 持久化以保留「当日已签」状态：签到后重启，面板按钮不回退成「签到」。
 	LastCheckinDay string     `json:"last_checkin_day,omitempty"`

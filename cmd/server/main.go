@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -18,7 +19,9 @@ import (
 	"time"
 
 	"yg-gateway/internal/auth"
+	"yg-gateway/internal/httpauth"
 	"yg-gateway/internal/livecfg"
+	"yg-gateway/internal/metrics"
 	"yg-gateway/internal/panel"
 	"yg-gateway/internal/pool"
 	"yg-gateway/internal/redisstore"
@@ -35,6 +38,7 @@ import (
 // 独立化后从 2.0.0 起号，明确区别于上游 1.x 线：
 //   - 2.0.0 = 脱离上游 fork 的首个版本（module 改名、身份标识改名、构建工具链升级）
 //   - 此后本仓库独立演进，不再与上游版本号对齐
+//
 // 注意：CI 发布时会断言 tag == 本值（剥掉后缀后比对），改这里要同步打 tag。
 const appVersion = "2.0.0"
 
@@ -105,9 +109,12 @@ func main() {
 	p.SetDegrade(cfg.Pool.DegradeThreshold, cfg.DegradeCooldownDur, cfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(cfg.SoftRateMaxDur)                 // 软冷却指数退避封顶（soft_rate_max，默认 2h）
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
+	p.SetBreakerProbeGap(cfg.BreakerProbeGapDur)         // 熔断 half-open 试探间隔（ADR-003 D-400，默认 30s；0 关闭）
+	p.SetGlobalMaxInFlight(cfg.Pool.GlobalMaxInFlight)   // 全局在途上限（ADR-003 D-401，默认 0 = 不限）
 	p.SetCreditFloor(cfg.Pool.CreditFloor)               // 积分保底（默认 0 = 关闭）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
+	p.SetEwma(cfg.Pool.Ewma.Enabled, cfg.Pool.Ewma.Alpha, cfg.Pool.Ewma.MinSamples) // EWMA 表现回灌（ADR-005 D-502，默认关 = 零回归）
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -236,13 +243,8 @@ func main() {
 
 	// 管理面板日志镜像：标准 log（stderr）与 chat 表格日志（stdout）双路复制进
 	// 面板环形缓冲，供 /panel/api/logs 读取；控制台输出行为完全不变。
-	// live 承载可热改字段（api_key/soft_rate/脱敏开关），面板保存配置时在线替换。
-	live := livecfg.New(livecfg.Snapshot{
-		APIKey:               cfg.APIKey,
-		SoftCooldown:         cfg.SoftRateDur,
-		SanitizeFingerprints: cfg.Features.SanitizeBlacklistFingerprints,
-		RecordClientInfo:     cfg.Logging.RequestClientInfo,
-	})
+	// live 承载可热改字段（api_key/多 key/soft_rate/脱敏开关），面板保存配置时在线替换。
+	live := livecfg.New(buildAuthSnapshot(cfg))
 	// 用量记录器：与 state 文件同目录，随 state_file 配置一起搬移。
 	// datapath 由 state 文件路径推出，避免再加一个配置项。
 	usagePath := usagePathFor(cfg.StateFile)
@@ -250,6 +252,10 @@ func main() {
 	rec.Start()
 	defer rec.Stop()
 	log.Printf("[usage] 逐请求用量记录已启用: %s (%s)", usagePath, rec.Describe())
+
+	// 延迟分位数观测（ADR-003 D-403）：自实现固定分桶，零新依赖。
+	// 进程级单例（无需落盘，重启归零——分位数是近期健康度而非历史账本）。
+	latencyReg := metrics.NewRegistry()
 
 	// 请求指标始终启用；JSONL 归档只写脱敏元数据，写盘失败不影响聊天请求。
 	requestLog := reqlog.New(reqlog.Config{
@@ -284,7 +290,7 @@ func main() {
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
 		ConfigPath: *cfgPath,
 		LoadConfig: func() (any, error) {
-			return Load(*cfgPath)
+			return loadConfigMasked(*cfgPath)
 		},
 		SaveConfig: func(raw []byte) ([]string, error) {
 			return saveConfig(raw, *cfgPath, live, p, up, sch)
@@ -297,19 +303,22 @@ func main() {
 	server.SetChatLogOutput(io.MultiWriter(os.Stdout, pn.Logs()))
 
 	h := server.NewHandler(server.Config{
-		Pool:         p,
-		Upstream:     up,
-		APIKey:       cfg.APIKey,
-		Session:      sessRouter,
-		StickyCount:  sessCount,
-		RedisMode:    redisMode,
-		SoftCooldown: cfg.SoftRateDur,
-		Panel:        pn,
-		Live:         live,
-		Usage:        rec,
-		RequestLog:   requestLog,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		Pool:     p,
+		Upstream: up,
+		APIKey:   cfg.APIKey,
+		Session:  sessRouter,
+		// 内容派生会话键开关（ADR-004）：关闭后只有显式会话标识才粘性。
+		DisableSessionDerive: !cfg.SessionStickyDerive,
+		StickyCount:          sessCount,
+		RedisMode:            redisMode,
+		SoftCooldown:         cfg.SoftRateDur,
+		Panel:                pn,
+		Live:                 live,
+		Usage:                rec,
+		Latency:              latencyReg,
+		RequestLog:           requestLog,
+		PromptMode:           cfg.Prompt.Mode,
+		PromptText:           cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,
@@ -360,12 +369,23 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// 排水窗口：给在途 SSE 请求时间完成。原 5s 太短——流式生成合法时长
+		// 可达数分钟，5s 一到进程强退、在途请求被硬掐（客户端收到半截流/连接
+		// 重置）。提到 30s：绝大多数请求（含典型 SSE）能正常完成；仍超时则
+		// 强退（记录日志，运维能看到"有在途请求被中断"）。
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		if err := srv.Shutdown(shutdownCtx); err != nil {
+			log.Printf("[shutdown] 30s 排水窗口超时（在途请求被中断）: %v", err)
+		} else {
+			log.Printf("[shutdown] 在途请求全部完成，进程退出")
+		}
 	}()
 
 	log.Printf("yg-gateway listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
+	// http.ErrServerClosed 是优雅停机的正常信号（signal → ctx 取消 → Shutdown
+	// 把 ListenAndServe 踢出来）——走正常返回路径，所有 defer（usage 落盘、
+	// requestLog.Close）执行。真实错误（端口占用等）才 Fatalf（os.Exit 会跳过 defer）。
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("http: %v", err)
 	}
@@ -427,7 +447,7 @@ func panelListenPath(listen string) string {
 //
 // 热生效范围（设计取舍）：
 //   - api_key / cooldown.soft_rate / features.sanitize_blacklist_fingerprints → livecfg 快照
-//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/SetPreferExpiring/SetCreditFloor
+//   - pool.* → pool.SetBreaker/SetMaxInFlight/SetSoftRateMax/SetWeights/SetCostExploreInterval/SetPreferExpiring/SetCreditFloor/SetEwma
 //   - schedule.* → scheduler.Reconfigure/SetBalanceInterval/SetExpiringSoonWindow
 //
 // 需重启（涉及监听地址、HTTP client 超时、auth_dir 等装配期依赖）：
@@ -496,12 +516,9 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	}
 
 	// 4) 热应用：能立即生效的字段全部应用，并列出仍需重启的字段。
-	live.Store(livecfg.Snapshot{
-		APIKey:               newCfg.APIKey,
-		SoftCooldown:         newCfg.SoftRateDur,
-		SanitizeFingerprints: newCfg.Features.SanitizeBlacklistFingerprints,
-		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
-	})
+	// 鉴权快照一次构建 + 一次原子切换（ADR-001 §六）：先在独立对象里完成
+	// 摘要计算与索引构建，成功后 Store；失败则不落盘不切换（见下方 err 检查）。
+	live.Store(buildAuthSnapshot(newCfg))
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
@@ -509,9 +526,12 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetDegrade(newCfg.Pool.DegradeThreshold, newCfg.DegradeCooldownDur, newCfg.DegradeCooldownMaxD)
 	p.SetSoftRateMax(newCfg.SoftRateMaxDur)
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
+	p.SetBreakerProbeGap(newCfg.BreakerProbeGapDur)         // half-open 试探间隔热生效（ADR-003 D-400）
+	p.SetGlobalMaxInFlight(newCfg.Pool.GlobalMaxInFlight)   // 全局在途上限热生效（ADR-003 D-401）
 	p.SetCreditFloor(newCfg.Pool.CreditFloor)               // 积分保底热生效（0 = 关闭）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
+	p.SetEwma(newCfg.Pool.Ewma.Enabled, newCfg.Pool.Ewma.Alpha, newCfg.Pool.Ewma.MinSamples) // EWMA 表现回灌热生效（ADR-005 D-502）
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
@@ -524,6 +544,87 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetIncludeDisabledInTasks(newCfg.Schedule.IncludeDisabledInTasks)
 
 	return restartRequiredFields(newCfg), nil
+}
+
+// loadConfigMasked 加载配置并脱敏密钥明文，供面板 GET /panel/api/config 回显。
+//
+// 阻断项 2（第一轮）：不得把 api_key / api_keys[].key 明文直接返回给面板。
+// 阻断项 1（第二轮）：脱敏占位符会被前端 collectConfig 当真实值提交，覆盖原密钥。
+// 因此 api_key 字段**留空**（前端空值 = 不修改），另加 api_key_configured 状态字段
+// 让前端显示「已配置」；api_keys[].key 同样留空 + 每项带 key_configured。
+func loadConfigMasked(path string) (any, error) {
+	c, err := Load(path)
+	if err != nil {
+		return nil, err
+	}
+	// 序列化成 map 再脱敏，避免依赖 *Config 的具体类型（panel 只当 any 用）。
+	raw, err := json.Marshal(c)
+	if err != nil {
+		return nil, err
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	// api_key：留空（不返回真实值，也不返回占位符，前端空 = 不修改），
+	// 另加 api_key_configured 状态（前端据此显示「已配置」而不误提交）。
+	if v, ok := m["api_key"]; ok {
+		if s, _ := v.(string); s != "" {
+			m["api_key"] = ""
+			m["api_key_configured"] = true
+		} else {
+			m["api_key_configured"] = false
+		}
+	}
+	// api_keys[].key：留空 + 每项 key_configured 状态。
+	if keys, ok := m["api_keys"].([]any); ok {
+		for _, k := range keys {
+			if km, ok := k.(map[string]any); ok {
+				if s, _ := km["key"].(string); s != "" {
+					km["key"] = ""
+					km["key_configured"] = true
+				} else {
+					km["key_configured"] = false
+				}
+			}
+		}
+	}
+	return m, nil
+}
+
+// buildAuthSnapshot 把 Config 的鉴权配置（单 api_key + 多 api_keys）转成运行时快照。
+//
+// 这是热更新的原子单元：在这里完成「配置 → 摘要 → 索引」的全部构建，返回的
+// Snapshot 由调用方一次 Store（ADR-001 §六）。APIKeys 已 normalize 过（空条目已过滤、
+// id/realm 已校验），这里只做摘要计算与运行时 Key 组装。
+//
+// 单 api_key 也作为一个合成条目（ID="single"）纳入索引：这样「单 Key + 多 Key 并存
+// 时两者都放行」由索引统一承载，鉴权侧无需区分来源（ADR-001 §四 兼容策略表第 3 行）。
+func buildAuthSnapshot(c *Config) livecfg.Snapshot {
+	keys := make([]httpauth.Key, 0, len(c.APIKeys)+1)
+	if c.APIKey != "" {
+		sum := sha256.Sum256([]byte(c.APIKey))
+		keys = append(keys, httpauth.Key{ID: httpauth.SingleKeyID, Digest: sum[:]})
+	}
+	for _, k := range c.APIKeys {
+		// Enabled=nil/true=启用；false=禁用（不进索引，但保留在 config.json 里以便面板管理）
+		if k.Enabled != nil && !*k.Enabled {
+			continue
+		}
+		sum := sha256.Sum256([]byte(k.Key))
+		keys = append(keys, httpauth.Key{
+			ID:     k.ID,
+			Name:   k.Name,
+			Digest: sum[:],
+			Models: k.Models,
+			Realm:  k.Realm,
+		})
+	}
+	snap := livecfg.BuildSnapshot(c.APIKey, keys)
+	snap.SoftCooldown = c.SoftRateDur
+	snap.SanitizeFingerprints = c.Features.SanitizeBlacklistFingerprints
+	snap.RecordClientInfo = c.Logging.RequestClientInfo
+	return snap
 }
 
 // restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
@@ -549,6 +650,14 @@ func restartRequiredFields(c *Config) []string {
 		out = append(out, "upstash")
 	}
 	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
+	// session_sticky.enabled 同样是装配期字段：sessRouter 只在启动时按它创建
+	// （见 main 的 session.New），运行期改它不会生效。此前漏列 → 面板保存后显示
+	// "已保存并立即生效"却不生效，用户以为开着粘性其实没开（R11 违反）。
+	out = append(out, "session_sticky.enabled")
+	// session_sticky.derive 同理：handler 在 NewHandler 时把开关复制进自己的 cfg
+	// （DisableSessionDerive），而 saveConfig 不重建 handler（只热改 live/pool/
+	// upstream/scheduler），故运行期改它不生效。
+	out = append(out, "session_sticky.derive")
 	out = append(out, "logging.request_archive_enabled", "logging.request_retention_days", "logging.request_archive_max_mb")
 	out = append(out, "server.read_timeout", "server.max_body_bytes")
 	// 入站边界加固字段在装配期被固化进 handler（body 上限 / 受信任代理匹配器 /

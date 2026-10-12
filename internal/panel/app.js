@@ -30,7 +30,14 @@ function applyTheme() {
     : '<path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/>';
   $('btnTheme').title = eff === 'light' ? '切换到深色' : '切换到浅色';
 }
-addEventListener('change', applyTheme);
+/* 主题切换：只在「跟随系统」时响应系统偏好变化。
+   此前是 window 上的 `addEventListener('change', applyTheme)` —— 页面上**任何**
+   change 事件（每个下拉、每个 checkbox、每个时间输入）都会冒泡到 window 触发
+   applyTheme()，而它会重写 #icoTheme 的 innerHTML。配置页有 40+ 控件，每次改动
+   都做一次无谓的 DOM 重写。 */
+matchMedia('(prefers-color-scheme: light)').addEventListener('change', () => {
+  if (theme === 'auto') applyTheme();
+});
 $('btnTheme').onclick = () => {
   theme = effTheme() === 'light' ? 'dark' : 'light';
   localStorage.setItem(LS_THEME, theme);
@@ -39,6 +46,10 @@ $('btnTheme').onclick = () => {
 applyTheme();
 
 /* ── 请求 ─────────────────────────────────────────────────────────── */
+/* api 面板后端调用。opts 额外支持 signal（AbortSignal）——轮询场景下新一轮开始
+   时 abort 掉上一轮未完成的请求，避免「慢响应后到覆盖新响应」。
+   典型：/packages 逐账号查上游偶慢（8s），而 5s 轮询的第二轮已返回（1s）——
+   没有取消机制时，第一轮的旧数据会覆盖第二轮的新数据。 */
 async function api(path, opts = {}) {
   const h = Object.assign({}, opts.headers || {});
   const k = localStorage.getItem(LS_KEY);
@@ -50,13 +61,132 @@ async function api(path, opts = {}) {
   if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
   return d;
 }
+/* abortable 为某类请求维护「最新一轮」的 AbortController：
+   调用返回 {signal, done()}，下次同 key 调用会先 abort 上一次。
+   用法：
+     const ctl = abortable('overview');
+     try { const d = await api('overview', { signal: ctl.signal }); ... }
+     finally { ctl.done(); }
+   注意：被 abort 的请求会抛 AbortError —— 调用方应把 AbortError 当成"本轮作废"
+   直接 return（不要 toast 报错）。isAbort 用于统一判断。 */
+const abortCtl = new Map();
+function abortable(key) {
+  const prev = abortCtl.get(key);
+  if (prev) prev.ctrl.abort();
+  const ctrl = new AbortController();
+  const entry = { ctrl, signal: ctrl.signal };
+  abortCtl.set(key, entry);
+  return {
+    signal: ctrl.signal,
+    done() { if (abortCtl.get(key) === entry) abortCtl.delete(key); },
+  };
+}
+function isAbort(e) {
+  return !!e && (e.name === 'AbortError' || /aborted|abort/i.test(String(e.message || '')));
+}
+/* toast 操作结果提示。三条改进（深度优化轮 前端 P1）：
+   ① 堆叠上限 5 条：连续批量操作此前会把右下角叠满、且无手动关闭；
+   ② 错误类停留 8s（成功 3.6s）：报错还没读完就消失是常见抱怨；
+   ③ 加手动关闭 ×：长文案/想先复制时不用等自动消失。
+   #toasts 已加 aria-live="polite"（见 index.html），读屏能播报结果。 */
 function toast(msg, cls) {
+  const host = $('toasts');
   const el = document.createElement('div');
   el.className = 'tst ' + (cls || '');
-  el.textContent = msg;
-  $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), 3600);
+  const txt = document.createElement('span');
+  txt.textContent = msg;
+  el.appendChild(txt);
+  const x = document.createElement('button');
+  x.className = 'tst-x';
+  x.type = 'button';
+  x.setAttribute('aria-label', '关闭提示');
+  x.textContent = '×';
+  x.onclick = () => el.remove();
+  el.appendChild(x);
+  host.appendChild(el);
+  // 超上限先挤掉最旧的（FIFO），避免叠满右下角。
+  while (host.children.length > 5) host.firstChild.remove();
+  setTimeout(() => el.remove(), cls === 'err' ? 8000 : 3600);
 }
+/* ── CSV / JSON 导出 ─────────────────────────────────────────────────
+   运维面板的常见诉求：把这张表导出去对账（进 Excel 做透视、按 Key 拆账、
+   留档）。此前面板完全没有导出能力（无 Blob、无 download）。
+   实现要点：
+     · BOM（\ufeff）必须加——否则 Excel 打开中文列名会乱码（GBK 环境）；
+     · 字段值统一走 csvCell 转义（含逗号/引号/换行时用双引号包裹并把内部 " 翻倍，
+       对齐 RFC 4180）；
+     · URL.revokeObjectURL 延迟回收，避免大文件下载被提前取消。 */
+function csvCell(v) {
+  const s = v == null ? '' : String(v);
+  // RFC 4180：含逗号、双引号、CR/LF 时用双引号包裹，内部引号翻倍。
+  if (/[",\r\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+function exportCSV(headers, rows, filename) {
+  const lines = [headers.map(csvCell).join(',')];
+  for (const r of rows) lines.push(r.map(csvCell).join(','));
+  // BOM 让 Excel 正确识别 UTF-8 中文
+  const blob = new Blob(['\ufeff' + lines.join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  downloadBlob(blob, filename);
+}
+function exportJSON(obj, filename) {
+  const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json;charset=utf-8' });
+  downloadBlob(blob, filename);
+}
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  // 延迟回收：立即 revoke 会让部分浏览器取消下载。
+  setTimeout(() => URL.revokeObjectURL(url), 4000);
+}
+// 导出文件名带时间戳，多次导出不互相覆盖。
+function exportStamp() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes());
+}
+
+/* ── 骨架屏 / 加载态 / 就地错误态 ────────────────────────────────────
+   与 index.html 的 .skel / .load-error 样式配套。
+   动机：加载态此前是纯文本（"正在向上游查询…"），而逐账号查上游可能几十秒——
+   纯文本空白期看起来像卡死；失败时又只有一行字，要重试还得滚回顶部找刷新按钮。 */
+function skelRows(n, cols) {
+  let out = '';
+  for (let i = 0; i < n; i++) {
+    let cells = '';
+    for (let c = 0; c < cols; c++) cells += '<span class="skel w-' + ((c % 4) + 1) + '"></span>';
+    out += '<div class="skel-row">' + cells + '</div>';
+  }
+  return out;
+}
+function skelCards(n) {
+  let out = '';
+  for (let i = 0; i < n; i++) {
+    out += '<div class="skel-card"><div class="skel"></div><div class="skel"></div>' +
+      '<div class="skel" style="width:60%"></div></div>';
+  }
+  return '<div class="skel-grid">' + out + '</div>';
+}
+function skelKpis(n) {
+  let out = '';
+  for (let i = 0; i < n; i++) out += '<div class="skel"></div>';
+  return '<div class="skel-kpi">' + out + '</div>';
+}
+/* 带转圈的加载提示（比裸文本多一个 spinner，明确"在动"）。 */
+function loadingMsg(text) {
+  return '<div class="skel-msg"><span class="spinner"></span><span>' + esc(text) + '</span></div>';
+}
+/* 就地错误块：原因 + 重试按钮（data-retry 由各视图的委托监听处理）。 */
+function loadErrorHTML(title, detail, retryLabel) {
+  return '<div class="load-error"><div class="big">' + esc(title) + '</div>' +
+    (detail ? '<div class="detail">' + esc(detail) + '</div>' : '') +
+    '<button class="xs" data-retry="1">' + esc(retryLabel || '重试') + '</button></div>';
+}
+
 // esc 文本/属性双安全转义。不能只用 div.innerHTML（它转义 <>& 但不转义引号），
 // 否则字符串拼进 HTML 属性（如 title="uid: ..."）时引号可闭合属性并注入事件处理器。
 // 显式替换 5 个字符：& < > " '（& 必须最先，避免二次转义）。
@@ -328,6 +458,9 @@ $('btnKey').onclick = async () => {
   } catch (e) { $('keyErr').hidden = false; }
 };
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
+// 密钥门表单回车提交：拦住默认行为（刷新页面会丢 localStorage 密钥、回到 401 循环）。
+// 原 onsubmit="return false" 内联属性被 CSP script-src 'self' 拦截失效，改为这里统一处理。
+$('keyGateForm').addEventListener('submit', e => { e.preventDefault(); $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 /* 积分包明细共享缓存：「积分构成」视图与首页「积分到期提醒」卡片共用同一份
@@ -338,13 +471,44 @@ let lastPackagesAt = 0;
 let expFetching = false;                       // 到期卡片在途标记（防重复打上游）
 const EXP_FRESH_MS = 2 * 60 * 1000;            // 缓存新鲜窗口：2 分钟内复用
 
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
-function go(v) {
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', keys: 'API Key 管理', config: '配置', logs: '运行日志' };
+
+/* cfgDirty 配置页未保存标记。
+   为什么需要：go() 进配置页会无条件 loadConfig() 重拉并整体回填表单。用户改了
+   若干字段后点别的导航，再点回来，改动被静默覆盖（savebar 的「放弃修改」是显式
+   入口，导航却是隐式入口却同效）——这是"配置页改了半天全没了"的根因。
+   置位：表单任意 input/change（见 CFG_MAP 绑定处）；清位：loadConfig 回填后、
+   保存成功后。 */
+let cfgDirty = false;
+function markCfgDirty() {
+  if (cfgDirty) return;
+  cfgDirty = true;
+  const n = $('cfgNote');
+  if (n) { n.textContent = '● 有未保存的改动'; n.classList.add('cfg-dirty'); }
+}
+function clearCfgDirty() {
+  cfgDirty = false;
+  const n = $('cfgNote');
+  if (n) { n.textContent = ''; n.classList.remove('cfg-dirty'); }
+}
+
+/* go 切换视图。skipGuard=true 用于初始深链（无用户改动可丢）。
+   返回 true 表示切换完成、false 表示被守卫拦下（用户在配置页有未保存改动）。 */
+function go(v, skipGuard) {
+  if (!skipGuard && view === 'config' && v !== 'config' && cfgDirty) {
+    if (!confirm('配置页有未保存的改动，切换视图会丢弃它们。确认离开？')) return false;
+    clearCfgDirty();
+  }
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
   $('ttl').textContent = TITLES[v];
+  // 切视图回顶：从很长的页面（积分构成/模型表）切到别的视图，若沿用旧滚动位置
+  // 会停在页面中部，看起来像"页面坏了"。初始深链由调用方传 skipGuard，此处只
+  // 在用户主动切换时回顶。
+  if (!skipGuard) window.scrollTo({ top: 0 });
   if (v === 'models' && !$('mdBody').children.length) loadModels();
+  if (v === 'keys') loadKeys();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
@@ -353,8 +517,25 @@ function go(v) {
   // 每轮刷新）。不再「打开账号池就打上游」——逐账号实时查在账号多时会卡死面板。
   // 完整逐包明细由卡片上的「检查」按钮显式触发（loadPackages/loadExpiry）。
   if (v === 'taskscenter') reattachQueueView();
+  return true;
 }
-document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
+
+/* 导航点击：用 pushState 写 hash，让浏览器前进/后退真正可用。
+   此前只 replaceState，历史里没有记录 → 按返回键直接离开面板（用户报"回不去"）。 */
+document.querySelectorAll('.nav a').forEach(a => a.onclick = e => {
+  e.preventDefault();
+  if (go(a.dataset.view) === false) return; // 被配置页守卫拦下：不改 hash
+  history.pushState(null, '', '#' + a.dataset.view);
+});
+/* hashchange：浏览器前进/后退、手改地址栏 hash 都走这里。
+   与导航点击去重：点击已 pushState 过，hashchange 只在 hash 真的变化时触发，
+   且此时 view 已等于目标 → 直接 return，不会重复 go()。 */
+addEventListener('hashchange', () => {
+  const h = (location.hash || '#accounts').slice(1);
+  if (!(h in TITLES) || h === view) return;
+  go(h); // 注意：此处改动不应再写 hash（已在 URL 里）
+});
+
 /* 首次进入延到本轮脚本求值之后再 go()。
    原因：go() 会同步触发视图的数据加载（loadUsage/loadLogs/loadPackages…），而这些
    函数读到的模块级 let/const（usageRateWarmAt、PK_* 等）在文件后半段才初始化——
@@ -363,11 +544,45 @@ document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDef
    延迟 0ms 让整份脚本先求值完，是修这一类问题最省事也最不容易再犯的办法。 */
 setTimeout(() => {
   const hash = (location.hash || '#accounts').slice(1);
-  go(hash in TITLES ? hash : 'accounts');
+  go(hash in TITLES ? hash : 'accounts', true); // skipGuard：初始进入无改动可丢，且不回顶
 }, 0);
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+/* renderAccounts 签名短路：内容没变就不重建 DOM。
+ *
+ * 为什么：面板每 5s 轮询一次 overview（refreshVisible），此前无条件走
+ * tb.innerHTML = ... 全量重绘。后果——
+ *   ① .acc tbody tr:hover 的悬停高亮每 5 秒被抹掉一次；
+ *   ② 用户正在表格里选中 uid 想复制时，选区随重绘消失；
+ *   ③ 行 title 气泡（成本台账 tip）悬停到一半被重建，提示闪断；
+ *   ④ 账号多时每 5 秒重建几十行 DOM，肉眼可见抖动。
+ * 签名比对让"数据没变"的绝大多数 tick 直接短路（零 DOM 操作）。
+ * 另加一条：用户正在表内交互（有焦点）时本轮直接跳过，避免打断输入/选择。
+ * 注意：签名必须覆盖**所有会影响渲染的字段**，否则该更新的不更新（比抖动更糟）。 */
+let accRenderSig = '';
+function accountsSig(list) {
+  return (list || []).map(s => [
+    s.uid, s.nickname, s.realm, s.enterprise ? 1 : 0,
+    s.disabled ? 1 : 0, s.paused ? 1 : 0, s.checkin_done ? 1 : 0,
+    s.credits, s.credits_total, s.success_count, s.err_total, s.in_flight,
+    Math.round(s.cool_remaining_sec || 0),
+    s.breaker_until || '', s.degrade_until || '', s.cool_kind || '',
+    s.reason || '', s.last_success || '',
+    (s.rate_limited_models || []).map(r => r.model + ':' + (r.kind || '') + ':' + (r.reset_at || '')).join(','),
+    JSON.stringify(s.token_usage || {}),
+    (s.model_costs || []).map(c => c.model + ':' + c.cost_per_1k).join(','),
+  ].join('\u0001')).join('\u0002');
+}
 function renderAccounts(list) {
+  const tb = $('accBody');
+  // 用户正在表内交互（聚焦/选中）时跳过本轮：重建会打断选择与输入。
+  if (document.activeElement && tb.contains(document.activeElement)) return;
+  const sig = accountsSig(list);
+  if (sig === accRenderSig) return; // 数据无变化：不碰 DOM
+  accRenderSig = sig;
+  renderAccountsUnsafe(list);
+}
+function renderAccountsUnsafe(list) {
   const tb = $('accBody');
   if (!list.length) {
     tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
@@ -455,7 +670,17 @@ function renderAccounts(list) {
 
 // renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。
 // 后端 model_locks 已按「整池不可用 → 没号可用 → 部分限流」排好序，这里只做展示。
+// 同样加签名短路：该表多数时候为空或不变，无需每 5 秒重建（与 renderAccounts 同理）。
+let mlRenderSig = '';
 function renderModelLocks(rows) {
+  const tb = $('mlBody');
+  if (!tb) return;
+  const sig = JSON.stringify(rows || []);
+  if (sig === mlRenderSig) return; // 无变化：不碰 DOM
+  mlRenderSig = sig;
+  renderModelLocksUnsafe(rows);
+}
+function renderModelLocksUnsafe(rows) {
   const tb = $('mlBody');
   if (!tb) return;
   const note = $('mlNote');
@@ -490,8 +715,15 @@ function renderModelLocks(rows) {
 }
 
 async function loadOverview(quiet) {
+  // 首屏加载骨架：账号表给行骨架，统计卡保持 HTML 里的「-」但补一条加载提示。
+  if (!overviewData) {
+    const tb = $('accBody');
+    if (tb && !tb.children.length) tb.innerHTML = '<tr><td colspan="9">' + skelRows(5, 7) + '</td></tr>';
+  }
+  // 防慢响应覆盖：新一轮开始时取消上一轮未完成的 overview 请求。
+  const ctl = abortable('overview');
   try {
-    const d = await api('overview');
+    const d = await api('overview', { signal: ctl.signal });
     overviewData = d;
     $('sTotal').textContent = d.total;
     $('sHealthy').textContent = d.healthy;
@@ -517,7 +749,25 @@ async function loadOverview(quiet) {
     // 到期卡片跟随首页统计同步刷新（用同一份响应里的到期快照，不额外发请求）。
     // 已有逐包明细缓存时不再覆盖——明细信息量更大，别把它降级成快照。
     if ($('expBox') && !lastPackages) renderExpirySnapshot(d);
-  } catch (e) { if (!quiet) toast(e.message, 'err'); }
+  } catch (e) {
+    // 本轮被下一轮 abort（慢响应作废）：静默返回，不报错也不改 UI。
+    if (isAbort(e)) return;
+    // 首屏失败此前完全静默（quiet=true 时一个字都不提示），7 个统计卡永远停在
+    // HTML 里的「-」、账号表空白，用户只能猜。这里区分首次与轮询：
+    //   首次（还没拿到过数据）→ 表内插持久化错误条 + 就地重试；
+    //   轮询失败 → 保持安静（避免每 5 秒弹一次 toast 刷屏）。
+    if (!overviewData) {
+      const tb = $('accBody');
+      if (tb) {
+        tb.innerHTML = '<tr><td colspan="9">' +
+          loadErrorHTML('读取账号池失败', e.message, '重试') + '</td></tr>';
+        bindRetry(tb, () => loadOverview(false));
+      }
+    }
+    if (!quiet) toast(e.message, 'err');
+  } finally {
+    ctl.done();
+  }
 }
 
 $('accBody').addEventListener('click', async ev => {
@@ -809,7 +1059,13 @@ async function loadLogs() {
     $('logNote').textContent = logCh === 'all'
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
       : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
-  } catch (e) { /* 概览已提示 */ }
+  } catch (e) {
+    // 此前是 `catch (e) { /* 概览已提示 */ }` —— 但概览的 toast 只在非 quiet 时弹，
+    // 且可能早已消失，日志页失败就变成"旧内容一直挂着"。改为在日志区就地提示 + 重试。
+    const boxEl = $('logBox');
+    if (boxEl) boxEl.innerHTML = loadErrorHTML('读取日志失败', e.message, '重试');
+    if (boxEl) bindRetry(boxEl, loadLogs);
+  }
 }
 
 function renderRequestMetrics(m, entries) {
@@ -868,11 +1124,24 @@ function reqCreditCell(e) {
 
 /* renderRequestTable 渲染请求记录表。来源列是这一版的重点：IP 用等宽字体方便扫，
    UA 单行截断（完整值在 title 里，行本身用 requestLogText 作 tooltip）。 */
+/* 请求记录分页参数：每页渲染条数。1000 行 × 10 列全量渲染会卡面板（DOM 构建 +
+   浏览器布局），而用户实际一次只看几十条。客户端分页：数据全量在内存（筛选/
+   导出不受影响），渲染只画当前页。 */
+const REQ_PAGE_SIZE = 50;
+let reqPage = 1;
+
 function renderRequestTable() {
   const list = reqEntries.filter(e => reqMatch(e));
   const tb = $('reqBody');
   if (!tb) return;
-  tb.innerHTML = list.map(e => {
+  // 分页：筛选结果可能变化（数量/排序），把当前页钳在有效范围内。
+  const totalPages = Math.max(1, Math.ceil(list.length / REQ_PAGE_SIZE));
+  if (reqPage > totalPages) reqPage = totalPages;
+  if (reqPage < 1) reqPage = 1;
+  const startIdx = (reqPage - 1) * REQ_PAGE_SIZE;
+  const pageItems = list.slice(startIdx, startIdx + REQ_PAGE_SIZE);
+
+  tb.innerHTML = pageItems.map(e => {
     const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
     const ip = e && e.client_ip ? e.client_ip : '';
     const ua = e && e.user_agent ? e.user_agent : '';
@@ -892,14 +1161,43 @@ function renderRequestTable() {
   }).join('') || '<tr><td colspan="10" class="empty">' +
       (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
 
+  // 分页器：>1 页才显示（单页时无噪音）。翻页只重画当前页，不重发请求。
+  const pagerHost = $('reqPager');
+  if (pagerHost) {
+    pagerHost.innerHTML = reqPagerHtml(list.length, reqPage, totalPages);
+    pagerHost.querySelectorAll('button[data-page]').forEach(b => {
+      b.onclick = () => { reqPage = Number(b.dataset.page); renderRequestTable(); };
+    });
+  }
+
   const filtered = list.length !== reqEntries.length;
   // 归档里的旧条目没有来源字段（该功能上线前写入）：这时提示开关/历史原因，
   // 而不是让人以为筛选坏了。
   const hasSource = reqEntries.some(e => e && (e.client_ip || e.user_agent));
   $('reqCount').textContent = !reqEntries.length ? ''
     : (filtered ? '命中 ' + list.length + ' / ' + reqEntries.length + ' 条' : reqEntries.length + ' 条') +
+      (totalPages > 1 ? ' · 第 ' + reqPage + '/' + totalPages + ' 页（每页 ' + REQ_PAGE_SIZE + ' 条）' : '') +
       (hasSource ? '' : ' · 来源未记录');
   $('reqCount').className = (filtered || !hasSource) ? 'note src-off' : 'note';
+}
+
+/* reqPagerHtml 生成分页器控件（首页/上一页/页码/下一页/末页）。
+   页码窗口：当前页前后各 2 页，避免 20 页时一排按钮。 */
+function reqPagerHtml(total, page, totalPages) {
+  if (totalPages <= 1) return '';
+  const btn = (label, target, disabled, on) =>
+    '<button class="xs' + (on ? ' primary' : '') + '"' +
+    (disabled ? ' disabled' : ' data-page="' + target + '"') + '>' + esc(label) + '</button>';
+  let nums = '';
+  const winStart = Math.max(1, page - 2), winEnd = Math.min(totalPages, page + 2);
+  if (winStart > 1) { nums += btn('1', 1, false, page === 1); if (winStart > 2) nums += '<span class="pg-ellipsis">…</span>'; }
+  for (let p = winStart; p <= winEnd; p++) nums += btn(String(p), p, false, p === page);
+  if (winEnd < totalPages) { if (winEnd < totalPages - 1) nums += '<span class="pg-ellipsis">…</span>'; nums += btn(String(totalPages), totalPages, false, page === totalPages); }
+  return '<span class="pg">' +
+    btn('‹', page - 1, page <= 1, false) +
+    nums +
+    btn('›', page + 1, page >= totalPages, false) +
+    '</span>';
 }
 
 /* 请求记录筛选控件。搜索框防抖 150ms：最多 1000 行重渲染，不必每键一次。
@@ -908,14 +1206,38 @@ function renderRequestTable() {
 let reqQTimer = null;
 if ($('reqQ')) $('reqQ').oninput = () => {
   clearTimeout(reqQTimer);
-  reqQTimer = setTimeout(() => { reqFilter.q = $('reqQ').value.trim(); renderRequestTable(); }, 150);
+  reqQTimer = setTimeout(() => { reqFilter.q = $('reqQ').value.trim(); reqPage = 1; renderRequestTable(); }, 150);
 };
 if ($('reqOutcome')) $('reqOutcome').onchange = () => {
   reqFilter.outcome = $('reqOutcome').value;
+  reqPage = 1; // 筛选变化：从第一页开始看，避免停在越界页
   renderRequestTable();
 };
-if ($('reqLimit')) $('reqLimit').onchange = loadLogs;
-if ($('btnReqReload')) $('btnReqReload').onclick = loadLogs;
+if ($('reqLimit')) $('reqLimit').onchange = () => { reqPage = 1; loadLogs(); };
+if ($('btnReqReload')) $('btnReqReload').onclick = () => { reqPage = 1; loadLogs(); };
+/* 请求记录导出：导出**当前筛选后**的行（与屏幕所见一致），不是全部 1000 条。
+   列口径与表格一致（时间/结果/模型/账号/来源IP/UA/耗时/Token/积分/请求ID）。 */
+if ($('btnReqExport')) $('btnReqExport').onclick = () => {
+  const list = reqEntries.filter(e => reqMatch(e));
+  if (!list.length) { toast('当前没有可导出的请求记录', 'err'); return; }
+  const headers = ['时间', '结果', '状态码', '模型', '账号', '来源IP', 'User-Agent', '耗时ms', 'Token', '积分', '请求ID'];
+  const rows = list.map(e => {
+    const total = Number(e && e.total_tokens || 0) ||
+      (Number(e && e.prompt_tokens || 0) + Number(e && e.completion_tokens || 0));
+    const credit = e && e.credit_known && Number.isFinite(Number(e.credit))
+      ? trimFixed(Number(e.credit).toFixed(2)) : '';
+    return [
+      e && e.time ? new Date(e.time).toLocaleString('zh-CN', { hour12: false }) : '',
+      ({ success: '成功', http_error: 'HTTP 错误', stream_error: '流错误', interrupted: '中断' })[e && e.outcome] || (e && e.outcome) || '',
+      e && e.status != null ? e.status : '',
+      e && e.model || '', e && e.account || '', e && e.client_ip || '', e && e.user_agent || '',
+      e && e.duration_ms != null ? e.duration_ms : '', total || '',
+      credit, e && e.request_id || '',
+    ];
+  });
+  exportCSV(headers, rows, 'requests-' + exportStamp() + '.csv');
+  toast('已导出 ' + rows.length + ' 条请求记录', 'ok');
+};
 // 时间范围：默认「全部历史」——请求记录页的历史行为就是"取最近 N 条"，
 // 加一个默认收窄的区间会让打开页面时看到的条数凭空变少。
 if ($('reqRange')) trangeBind('reqRange', loadLogs, '0');
@@ -964,6 +1286,417 @@ $('btnLogPin').onclick = () => {
   $('btnLogPin').textContent = '自动滚动：' + (logPin ? '开' : '关');
 };
 
+/* ── API Key 管理（二期，ADR-002）─────────────────────────────────── */
+/* 独立视图 view-keys：卡片式列表 + 弹窗表单，复用 GET/POST /panel/api/config。
+ * 一期 loadConfigMasked 已把 api_keys[].key 留空 + key_configured 状态字段；
+ * mergeConfigMaps 对数组整体替换；normalizeAPIKeys 校验 id/realm/models。
+ * 零新增后端接口，纯前端 + go:embed 重编译。
+ *
+ * UI 设计对齐竞品调研（panel-key-mgmt-ui-competitive-notes.md）：
+ * - 卡片式列表（对齐 hub），不是表格行内编辑
+ * - 弹窗表单新增/编辑（三家都用弹窗）
+ * - 创建后明文一次性展示（对齐 manager，只存哈希）
+ * - 胶囊式 realm 开关（对齐 hub），不是 select 下拉
+ * - models 三态展示（对齐 ARP）：null=全部/[]=不放行/[a,b]=N个
+ * - 空状态区分（对齐 manager）：取数失败≠没有密钥
+ * - 提交锁（对齐 manager）：防连点建重复 */
+
+let keyData = null;       // GET config 返回的 api_keys 数组（脱敏后）
+let keyAdminCfg = false;  // api_key_configured 状态
+let keyEditing = null;    // 当前编辑中的 Key 对象（null=未编辑）
+let keyIsNew = false;     // true=新增模式, false=编辑模式
+let keySaving = false;    // 提交锁：防连点建重复 Key
+let keyLoadFailed = false; // 取数失败标记（区分空状态）
+
+async function loadKeys() {
+  try {
+    const d = await api('config');
+    keyData = Array.isArray(d.config.api_keys) ? d.config.api_keys : [];
+    keyAdminCfg = !!d.config.api_key_configured;
+    keyLoadFailed = false;
+    renderKeyList();
+  } catch (e) {
+    keyLoadFailed = true;
+    keyData = [];
+    renderKeyList();
+    $('keyLoadErrMsg').textContent = e.message || '未知错误';
+  }
+}
+
+function renderKeyList() {
+  $('keyAdminStatus').textContent = '管理员密钥(api_key)：' + (keyAdminCfg ? '已配置' : '未配置');
+  const list = $('keyBody');
+  const empty = $('keyEmpty');
+  const loadErr = $('keyLoadError');
+
+  // 取数失败 ≠ 没有密钥（对齐 manager 防误重建）
+  if (keyLoadFailed) {
+    list.innerHTML = '';
+    empty.hidden = true;
+    loadErr.hidden = false;
+    return;
+  }
+  loadErr.hidden = true;
+
+  if (!keyData.length) {
+    list.innerHTML = '';
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+  list.innerHTML = '';
+  keyData.forEach((k) => { list.insertAdjacentHTML('beforeend', keyCardHTML(k)); });
+  attachKeyCardEvents();
+}
+
+function keyCardHTML(k) {
+  const id = esc(k.id || ''), name = esc(k.name || '') || '—';
+  const cfg = !!k.key_configured;
+  const en = k.enabled !== false;
+  const realm = esc(k.realm || '');
+
+  // realm badge（胶囊式，对齐 hub）
+  const realmBadge = realm === 'cn'
+    ? '<span class="key-badge realm-cn">国内版</span>'
+    : realm === 'global'
+      ? '<span class="key-badge realm-global">国际版</span>'
+      : '<span class="key-badge realm-all">不限</span>';
+
+  // models 三态展示（对齐 ARP）
+  let modelsBadge;
+  if (k.models == null) {
+    modelsBadge = '<span class="key-badge models-all">全部模型</span>';
+  } else if (Array.isArray(k.models) && k.models.length === 0) {
+    modelsBadge = '<span class="key-badge models-block">不放行</span>';
+  } else if (Array.isArray(k.models)) {
+    const n = k.models.length;
+    const names = k.models.map(esc).join(', ');
+    modelsBadge = `<span class="key-badge models-list" title="${names}">${n} 个模型</span>`;
+  } else {
+    modelsBadge = '<span class="key-badge models-all">全部模型</span>';
+  }
+
+  // 密钥状态（脱敏：只显示「已配置/未配置」，不显示明文）
+  const keyStatus = cfg
+    ? '<span class="tag ok">已配置</span>'
+    : '<span class="tag mute">未配置</span>';
+
+  return `<div class="key-card${en ? '' : ' disabled'}" data-kid="${id}">
+    <div class="key-card-main">
+      <div class="key-info">
+        <span class="key-name">${name}</span>
+        <span class="key-id">#${id}</span>
+        ${keyStatus}
+        ${realmBadge}
+        ${modelsBadge}
+      </div>
+      <div class="key-actions">
+        <label class="switch" title="${en ? '已启用' : '已禁用'}">
+          <input type="checkbox" data-action="toggle" data-kid="${id}" ${en ? 'checked' : ''}>
+          <span class="switch-track"></span>
+        </label>
+        <button class="xs" data-action="edit" data-kid="${id}">编辑</button>
+        <button class="xs danger" data-action="delete" data-kid="${id}">删除</button>
+      </div>
+    </div>
+  </div>`;
+}
+
+function attachKeyCardEvents() {
+  const list = $('keyBody');
+  list.querySelectorAll('[data-action="toggle"]').forEach(el => {
+    el.onchange = () => toggleKeyEnabled(el.dataset.kid, el.checked);
+  });
+  list.querySelectorAll('[data-action="edit"]').forEach(el => {
+    el.onclick = () => openKeyDialog(el.dataset.kid);
+  });
+  list.querySelectorAll('[data-action="delete"]').forEach(el => {
+    el.onclick = () => deleteKey(el.dataset.kid);
+  });
+}
+
+/* ── 弹窗表单（新增/编辑）────────────────────────────────────────── */
+
+function openKeyDialog(id) {
+  const k = id ? keyData.find(x => x.id === id) : null;
+  keyEditing = k || null;
+  keyIsNew = !k;
+
+  $('keyDlgTitle').textContent = k ? '编辑 Key' : '新增 Key';
+  $('keyDlgHint').textContent = k ? `编辑 Key「${k.name || k.id}」` : '配置一条新的 API Key';
+  // 注意：input.value 是**纯文本**赋值，不能再过 esc()（HTML 转义）——
+  // 曾在这里误用 esc()，导致名字含 & 的 Key 显示成 A&amp;B，保存写回后被二次
+  // 转义成 A&amp;amp;B（越改越脏）；kfId 参与鉴权匹配，破坏性更大。
+  // 拼进 innerHTML 的字符串（如卡片渲染）才需要 esc，见 keyCardHTML。
+  $('kfName').value = k ? (k.name || '') : '';
+  $('kfId').value = k ? (k.id || '') : '';
+  $('kfId').disabled = !!k; // 编辑时 ID 不可改
+  $('kfKey').value = '';
+  $('kfKey').type = 'password';
+  $('kfKeyHint').textContent = k
+    ? '留空 = 不修改密钥；填写 = 更新为新密钥'
+    : '必填；点击「生成」可一键生成随机密钥';
+  $('kfModels').value = (k && Array.isArray(k.models)) ? k.models.join(', ') : '';
+
+  // realm 胶囊（默认不限）
+  const realm = k ? esc(k.realm || '') : '';
+  $('kfRealmPills').querySelectorAll('.realm-pill').forEach(p => {
+    p.classList.toggle('on', p.dataset.realm === realm);
+  });
+
+  showVeil('keyEditVeil');
+  if (!k) $('kfId').focus();
+}
+
+function closeKeyDialog() {
+  hideVeil('keyEditVeil');
+  keyEditing = null;
+  keyIsNew = false;
+}
+
+function getCurrentRealm() {
+  const on = $('kfRealmPills').querySelector('.realm-pill.on');
+  return on ? on.dataset.realm : '';
+}
+
+function genApiKey() {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  const arr = new Uint8Array(32);
+  crypto.getRandomValues(arr);
+  let s = 'sk-';
+  for (let i = 0; i < 32; i++) s += chars[arr[i] % chars.length];
+  return s;
+}
+
+function collectKeyFromDialog() {
+  const id = $('kfId').value.trim();
+  if (!id) { toast('ID 不能为空', 'err'); $('kfId').focus(); return null; }
+  if (!/^[A-Za-z0-9_-]+$/.test(id)) { toast('ID 只能含字母、数字、下划线、连字符', 'err'); $('kfId').focus(); return null; }
+
+  const entry = { id };
+  const name = $('kfName').value.trim();
+  if (name) entry.name = name;
+
+  const key = $('kfKey').value.trim();
+  if (keyIsNew) {
+    if (!key) { toast('新增 Key 时密钥必填', 'err'); $('kfKey').focus(); return null; }
+    entry.key = key;
+  } else if (key) {
+    entry.key = key; // 编辑时填了新值才更新
+  }
+
+  const realm = getCurrentRealm();
+  if (realm) entry.realm = realm;
+
+  const models = $('kfModels').value.trim();
+  if (models) {
+    entry.models = models.split(/[,，\s]+/).filter(Boolean);
+  } else if (keyIsNew) {
+    entry.models = null; // 新增时不填 = 不限（null 三态）
+  }
+
+  return entry;
+}
+
+function buildSavePayload(newEntry) {
+  // 构建完整 api_keys 数组提交（对齐现有 POST /panel/api/config 整体替换语义）
+  const out = [];
+  let replaced = false;
+  keyData.forEach((k) => {
+    if (newEntry && k.id === newEntry.id) {
+      // 编辑：合并更新（保留原有字段，覆盖提交的字段）
+      const merged = { id: k.id };
+      if (k.name) merged.name = k.name;
+      if (newEntry.name) merged.name = newEntry.name;
+      if (newEntry.key) merged.key = newEntry.key;
+      else if (k.key) merged.key = k.key;
+      if (newEntry.realm !== undefined) merged.realm = newEntry.realm;
+      else if (k.realm) merged.realm = k.realm;
+      if (newEntry.models !== undefined) merged.models = newEntry.models;
+      else if (Array.isArray(k.models)) merged.models = k.models;
+      merged.enabled = k.enabled !== false;
+      out.push(merged);
+      replaced = true;
+    } else {
+      // 保留其他 Key 原样
+      const entry = { id: k.id, enabled: k.enabled !== false };
+      if (k.name) entry.name = k.name;
+      if (k.key) entry.key = k.key;
+      if (k.realm) entry.realm = k.realm;
+      if (Array.isArray(k.models)) entry.models = k.models;
+      out.push(entry);
+    }
+  });
+  if (newEntry && !replaced) out.push(newEntry); // 新增
+  return out;
+}
+
+async function saveKeyFromDialog() {
+  if (keySaving) return; // 提交锁：防连点建重复
+  const entry = collectKeyFromDialog();
+  if (!entry) return;
+
+  keySaving = true;
+  try {
+    const payload = buildSavePayload(entry);
+    const r = await api('config', { method: 'POST', body: JSON.stringify({ api_keys: payload }) });
+    toast('Key 配置已保存，热生效', 'ok');
+
+    // 新增且有明文返回 → 展示一次性明文弹窗
+    if (keyIsNew && entry.key) {
+      closeKeyDialog();
+      showKeyPlaintext(entry.key);
+    } else {
+      closeKeyDialog();
+    }
+    loadKeys();
+  } catch (e) {
+    toast('保存失败：' + e.message, 'err');
+  } finally {
+    keySaving = false;
+  }
+}
+
+async function toggleKeyEnabled(id, enabled) {
+  const keys = keyData.map(k => {
+    const entry = { id: k.id, enabled: enabled ? true : false };
+    if (k.name) entry.name = k.name;
+    if (k.key) entry.key = k.key;
+    if (k.realm) entry.realm = k.realm;
+    if (Array.isArray(k.models)) entry.models = k.models;
+    return entry;
+  });
+  try {
+    await api('config', { method: 'POST', body: JSON.stringify({ api_keys: keys }) });
+    toast(`Key「${id}」已${enabled ? '启用' : '禁用'}，热生效`, 'ok');
+    loadKeys();
+  } catch (e) { toast('切换失败：' + e.message, 'err'); loadKeys(); }
+}
+
+function deleteKey(id) {
+  const k = keyData.find(x => x.id === id);
+  const label = (k && (k.name || k.id)) || id;
+  if (!confirm(`确认删除 Key「${label}」？\n\n删除后立即生效，该 Key 将无法再用于鉴权。`)) return;
+  const remaining = keyData.filter(x => x.id !== id);
+  const payload = remaining.length ? remaining.map(k => {
+    const entry = { id: k.id, enabled: k.enabled !== false };
+    if (k.name) entry.name = k.name;
+    if (k.key) entry.key = k.key;
+    if (k.realm) entry.realm = k.realm;
+    if (Array.isArray(k.models)) entry.models = k.models;
+    return entry;
+  }) : null;
+  saveKeys(payload, `Key「${label}」已删除，热生效`);
+}
+
+async function saveKeys(keys, successMsg) {
+  if (keySaving) return;
+  keySaving = true;
+  try {
+    await api('config', { method: 'POST', body: JSON.stringify({ api_keys: keys }) });
+    toast(successMsg || 'Key 配置已保存，热生效', 'ok');
+    loadKeys();
+  } catch (e) { toast('保存失败：' + e.message, 'err'); }
+  finally { keySaving = false; }
+}
+
+/* ── 明文展示弹窗 ────────────────────────────────────────────────── */
+
+function showKeyPlaintext(plaintext) {
+  $('keyPlaintext').textContent = plaintext;
+  showVeil('keyShowVeil');
+}
+
+async function copyKeyPlaintext() {
+  const text = $('keyPlaintext').textContent;
+  try {
+    if (navigator.clipboard && window.isSecureContext) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    toast('已复制到剪贴板', 'ok');
+  } catch (e) { toast('复制失败：' + e.message, 'err'); }
+}
+
+/* ── 弹窗辅助（veil 切换）────────────────────────────────────────── */
+
+function showVeil(id) { $(id).classList.add('on'); }
+function hideVeil(id) { $(id).classList.remove('on'); }
+
+/* ── 事件绑定 ────────────────────────────────────────────────────── */
+
+$('btnKeyReload').onclick = loadKeys;
+$('btnKeyRetry').onclick = loadKeys;
+$('btnKeyAdd').onclick = () => openKeyDialog(null);
+$('btnKeyCancel').onclick = closeKeyDialog;
+$('btnKeySave').onclick = saveKeyFromDialog;
+$('btnKeyGen').onclick = () => {
+  const input = $('kfKey');
+  input.value = genApiKey();
+  input.type = 'text';
+};
+$('btnKeyCopy').onclick = copyKeyPlaintext;
+$('btnKeyShowClose').onclick = () => hideVeil('keyShowVeil');
+
+// realm 胶囊切换
+$('kfRealmPills').querySelectorAll('.realm-pill').forEach(p => {
+  p.onclick = () => {
+    $('kfRealmPills').querySelectorAll('.realm-pill').forEach(x => x.classList.remove('on'));
+    p.classList.add('on');
+  };
+});
+
+/* ── 弹窗统一关闭（Esc / 点击遮罩）────────────────────────────────────
+   此前只有 Key 的两个弹窗有 Esc 与遮罩关闭：addVeil（添加账号）、taskVeil（积分
+   任务，940px 大弹窗）、vcVeil（券码）、keyVeil（密钥门）都没有出口——键盘用户
+   只能摸鼠标找「关闭」。
+   这里统一登记：每个 veil 一个关闭回调；Esc 从后往前关当前打开的那个（与视觉层级
+   一致）；点遮罩空白处关闭（data-lock 的弹窗禁止，如密钥门必须输入密钥）。 */
+const VEIL_CLOSERS = {
+  // 用直接 DOM 操作 + 必要的状态清理，而不是调用 closeAdd()/closeTasks()：
+  // 后者声明在本文件更下方（函数声明虽会 hoist，但这里刻意不依赖求值顺序，
+  // 也让「关弹窗」这件事的语义在本地一目了然）。
+  addVeil: () => { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); },
+  taskVeil: () => { $('taskVeil').classList.remove('on'); taskUID = null; },
+  vcVeil: () => $('vcVeil').classList.remove('on'),
+  keyEditVeil: () => closeKeyDialog(),
+  keyShowVeil: () => hideVeil('keyShowVeil'),
+  keyVeil: () => $('keyVeil').classList.remove('on'), // data-lock 时由下方逻辑跳过
+};
+
+// 点击遮罩关闭（事件目标就是 veil 本身 = 点在遮罩空白处，不是在 .dlg 上）
+Object.entries(VEIL_CLOSERS).forEach(([id, close]) => {
+  const el = $(id);
+  if (!el) return;
+  el.onclick = (e) => {
+    if (e.target !== el) return;      // 点在弹窗内容里，不关
+    if (el.dataset.lock) return;      // data-lock="1"：必须显式操作才能关（如密钥门）
+    close();
+  };
+});
+
+// Esc 关闭：从后往前找当前打开的 veil，只关最上面那个（一次一个，符合直觉）。
+document.addEventListener('keydown', (e) => {
+  if (e.key !== 'Escape') return;
+  const ids = Object.keys(VEIL_CLOSERS);
+  for (let i = ids.length - 1; i >= 0; i--) {
+    const el = $(ids[i]);
+    if (el && el.classList.contains('on')) {
+      if (el.dataset.lock) continue; // data-lock：Esc 也不关（须输入密钥）
+      VEIL_CLOSERS[ids[i]]();
+      return;
+    }
+  }
+});
+
 /* ── 配置 ─────────────────────────────────────────────────────────── */
 const CFG_MAP = {
   listen: ['listen'], api_key: ['api_key'],
@@ -983,6 +1716,8 @@ const CFG_MAP = {
   prefer_expiring: ['pool', 'prefer_expiring'], expiring_soon: ['pool', 'expiring_soon'],
   soft_rate: ['cooldown', 'soft_rate'], soft_rate_max: ['cooldown', 'soft_rate_max'],
   breaker_cooldown: ['pool', 'breaker_cooldown'], breaker_cooldown_max: ['pool', 'breaker_cooldown_max'],
+  breaker_probe_gap: ['pool', 'breaker_probe_gap'],
+  global_max_in_flight: ['pool', 'global_max_in_flight'],
   idle_weight_per_hour: ['pool', 'idle_weight_per_hour'], idle_weight_max: ['pool', 'idle_weight_max'],
   ttl: ['session_sticky', 'ttl'],
   timeout_seconds: ['upstream', 'timeout_seconds'], header_timeout_seconds: ['upstream', 'header_timeout_seconds'],
@@ -990,6 +1725,7 @@ const CFG_MAP = {
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
+  session_sticky_derive: ['session_sticky', 'derive'],
   request_client_info: ['logging', 'request_client_info'],
 };
 /* 「覆盖型」文本字段：空串本身是有意义的取值（= 回落到内置默认），必须照发。
@@ -1027,7 +1763,8 @@ async function loadConfig() {
       else el.value = v == null ? '' : v;
     }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
-    $('cfgNote').textContent = '';
+    // 回填即"与后端一致"→ 清掉脏标记（避免刚加载就被判为有未保存改动）。
+    clearCfgDirty();
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
 }
 function collectConfig() {
@@ -1055,7 +1792,8 @@ function collectConfig() {
    不再等到保存被拒。 */
 const DURATION_RE = /^(\d+(\.\d+)?(ns|us|µs|ms|s|m|h))+$/;
 const DURATION_FIELDS = ['soft_rate', 'soft_rate_max', 'breaker_cooldown', 'breaker_cooldown_max',
-  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl'];
+  'degrade_cooldown', 'degrade_cooldown_max', 'cost_explore_interval', 'expiring_soon', 'ttl',
+  'breaker_probe_gap'];
 const DURATION_TIP = '格式应为 Go 时长：30m / 2h / 600s / 1h30m';
 function durationBad(name) {
   const el = $('cfgForm').elements[name];
@@ -1073,8 +1811,11 @@ function markDurationFields() {
   }
 }
 $('cfgForm').addEventListener('input', ev => {
+  markCfgDirty(); // 任何改动都置脏（供 go() 的切换守卫与 #cfgNote 提示）
   if (DURATION_FIELDS.includes(ev.target.name)) markDurationFields();
 });
+// checkbox / select 改动同样算脏（input 事件在部分浏览器对 checkbox 不触发）
+$('cfgForm').addEventListener('change', markCfgDirty);
 $('btnEye').onclick = () => {
   const el = $('cfgKey');
   const show = el.type === 'password';
@@ -1201,16 +1942,36 @@ $('importFile').onchange = async () => {
 
 /* ── 顶部动作 ─────────────────────────────────────────────────────── */
 $('btnAdd').onclick = openAdd;
+/* 顶栏「刷新」= 只刷新视图（重拉 overview + 当前视图数据），**不打上游**。
+   此前这里直接调 balance_all（对所有账号向上游查余额，是重量级操作），
+   但按钮文案是「刷新」——用户只想刷新视图时却触发了整池上游请求。
+   真实的「从上游刷新余额」已挪到账号池 header（见 btnBalanceAll），与其它批量
+   按钮同处，且带二次确认。 */
 $('btnRefresh').onclick = async () => {
   const b = $('btnRefresh');
+  b.disabled = true; b.textContent = '刷新中…';
+  try {
+    await loadOverview(true);
+    if (view === 'logs') await loadLogs();
+    else if (view === 'usage') await loadUsage();
+    else if (view === 'keys') await loadKeys();
+    else if (view === 'models') await loadModels();
+    else if (view === 'packages') await loadPackages(true);
+  } catch (e) { toast('刷新失败：' + e.message, 'err'); }
+  finally { b.disabled = false; b.textContent = '刷新'; }
+};
+
+/* 「从上游刷新余额」：独立的重量级操作（逐账号查上游），故带二次确认。 */
+$('btnBalanceAll').onclick = async () => {
+  if (!confirm('将从上游逐账号查询余额并写回积分快照。\n账号多时会持续数秒到数十秒，确认继续？')) return;
+  const b = $('btnBalanceAll');
   b.disabled = true; b.textContent = '刷新中…';
   try {
     await api('balance_all', { method: 'POST' });
     await loadOverview(true);
     toast('余额已从上游刷新', 'ok');
-  } catch (e) { toast('刷新失败：' + e.message, 'err'); await loadOverview(true); }
-  finally { b.disabled = false; b.textContent = '刷新'; }
-  if (view === 'logs') loadLogs();
+  } catch (e) { toast('刷新失败：' + e.message, 'err'); }
+  finally { b.disabled = false; b.textContent = '刷新余额'; }
 };
 
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
@@ -1222,13 +1983,29 @@ function refreshVisible() {
 function start() {
   loadOverview(true);
   if (refTimer) clearInterval(refTimer);
-  refTimer = setInterval(refreshVisible, 5000);
+  // 页面隐藏（切到别的标签页/最小化）时不轮询：此前无视 document.hidden，
+  // 后台标签页每 5 秒打一次 overview（日志页还会并发 3 个接口），纯浪费
+  // CPU 与上游配额。可见时由 visibilitychange 恢复。
+  if (!document.hidden) refTimer = setInterval(refreshVisible, 5000);
   checkAuthGate();
 }
 async function checkAuthGate() {
   try { await api('overview'); }
   catch (e) { if (String(e.message).includes('密钥') || String(e.message).includes('api_key')) return; }
 }
+/* 可见性变化：隐藏时停表，恢复时立刻刷新一次并重新开始轮询。
+   立刻刷一次是必要的——后台期间数据可能已变，回到前台应看到最新值。 */
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    if (refTimer) { clearInterval(refTimer); refTimer = null; }
+    // queueTimer 声明在本文件更下方（let，存在 TDZ）：用 typeof 守卫避免
+    // 在声明前触发 visibilitychange 时抛 ReferenceError。
+    if (typeof queueTimer !== 'undefined' && queueTimer) { clearInterval(queueTimer); queueTimer = null; }
+  } else {
+    start();
+    if (view === 'taskscenter') reattachQueueView();
+  }
+});
 start();
 
 /* ── 积分任务 ─────────────────────────────────────────────────────── */
@@ -1656,17 +2433,25 @@ $('btnVcRefresh').onclick = loadSchoolVouchers;
    队列状态覆盖。 */
 let queueTimer = null, lastQueueSeq = 0;
 const GROWTH_TITLES = {}; // code → 展示名（扫描时从任务列表带出）
-$('btnScanAll').onclick = async () => {
-  const b = $('btnScanAll');
+async function runScanAll(btn) {
   // 停掉队列轮询：显式扫描 = 切到待办视图。否则在途队列的下一 tick 会把扫描
   // 结果冲掉重渲染回队列视图（服务端执行不受影响，只是不再实时回写本视图）。
   if (queueTimer) { clearInterval(queueTimer); queueTimer = null; }
+  const b = btn || $('btnScanAll');
   b.disabled = true; b.textContent = '扫描中…';
   try {
     const d = await api('tasks/scan_all', { method: 'POST' });
     renderQueue(groupItems(d), null, '没有待办任务 🎉', '全部账号的成长任务与开学季活动都已完成，明日再来。');
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; b.textContent = '扫描待办'; }
+}
+$('btnScanAll').onclick = () => runScanAll($('btnScanAll'));
+// 空态 CTA：与 header 的「扫描待办」共用同一实现，文案保持不变。
+if ($('btnScanAllEmpty')) $('btnScanAllEmpty').onclick = () => {
+  const b = $('btnScanAllEmpty');
+  const orig = b.textContent;
+  b.textContent = '扫描中…'; b.disabled = true;
+  runScanAll(b).finally(() => { b.disabled = false; b.textContent = orig; });
 };
 $('btnRunQueue').onclick = async () => {
   const conc = Number($('qcConc').value) || 1;
@@ -1887,6 +2672,8 @@ const US_DIMS = {
   account: { key: 'by_account', title: '账号', withRealm: true, withPerf: true, span: 10 },
   model: { key: 'by_model', title: '模型', withRealm: false, withPerf: false, span: 7 },
   realm: { key: 'by_realm', title: 'realm', withRealm: false, withPerf: false, span: 7 },
+  // Key 维度带性能两列（谁在拖慢网关，按 Key 看得出来），故 span 与 account 同为 9+1。
+  key: { key: 'by_key', title: 'API Key', withRealm: false, withPerf: true, span: 9 },
 };
 
 // usSortRows 按当前排序字段降序（默认合计 Token，最大者最相关）。
@@ -1921,7 +2708,8 @@ function usTabsHtml(dims, active, counts) {
   }).join('');
 }
 
-const US_DIM_TABS = [['account', '按账号'], ['model', '按模型'], ['realm', '按域']];
+const US_DIM_TABS = [['account', '按账号'], ['model', '按模型'], ['realm', '按域'], ['key', '按 Key']];
+const US_CREDIT_TABS = [['account', '按账号'], ['model', '按模型'], ['key', '按 Key']];
 
 function renderUsageDim() {
   const d = usageData || {};
@@ -1931,27 +2719,37 @@ function renderUsageDim() {
     account: (d.by_account || []).length,
     model: (d.by_model || []).length,
     realm: (d.by_realm || []).length,
+    key: (d.by_key || []).length,
   });
   $('usDimHead').innerHTML = usDimHead(usDim);
   $('usDimBody').innerHTML = rows.map(x =>
     usRow(usDim === 'account' ? String(x.key || '').slice(0, 8) : x.key,
-      usDim === 'account' ? (x.extra || '') : '',
+      (usDim === 'account' || usDim === 'key') ? (x.extra || '') : '',
       x,
       usDim === 'account' ? '<td class="num">' + esc(x.realm || '') + '</td>' : '',
       m.withPerf)
   ).join('') || '<tr><td colspan="' + m.span + '" class="empty">暂无数据</td></tr>';
-  $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
+  // Key 维度的口径说明：只对「有 Key 鉴权」的部署有意义，未启用鉴权时全落在未归因行。
+  $('usDimNote').textContent = usDim === 'key'
+    ? rows.length + ' 行 · 按鉴权 Key 归因（未启用鉴权 / 旧数据归入「未归因」）'
+    : rows.length + ' 行 · 请求数含失败尝试';
 }
 
-/* 积分扣除：按账号 / 按模型两个维度共用一张表（同上，两个 box 合成一个）。 */
+/* 积分扣除：按账号 / 按模型 / 按 Key 三个维度共用一张表（同上，多个 box 合成一个）。 */
 function usCreditHead(dim) {
-  return dim === 'model'
-    ? '<tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th>' +
-      '<th class="num">请求</th><th class="num">扣除积分</th>' +
-      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>'
-    : '<tr><th class="mark" aria-hidden="true"></th><th>账号</th>' +
+  if (dim === 'model') {
+    return '<tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th>' +
       '<th class="num">请求</th><th class="num">扣除积分</th>' +
       '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>';
+  }
+  if (dim === 'key') {
+    return '<tr><th class="mark" aria-hidden="true"></th><th>API Key</th>' +
+      '<th class="num">请求</th><th class="num">扣除积分</th>' +
+      '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>';
+  }
+  return '<tr><th class="mark" aria-hidden="true"></th><th>账号</th>' +
+    '<th class="num">请求</th><th class="num">扣除积分</th>' +
+    '<th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th><th class="num">缓存命中率</th></tr>';
 }
 
 /* 缓存命中率（issue #92）：颜色即健康度——≥90% 绿 / 80–90% 黄 / <80% 红，
@@ -1983,6 +2781,25 @@ function renderCreditDim() {
         '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
       '</tr>'
     ).join('') || '<tr><td colspan="8" class="empty">' + empty + '</td></tr>';
+  } else if (usCreditDim === 'key') {
+    // 按 Key 的积分扣除（ADR-001 F-005 二期）：谁在烧积分一眼可见。
+    const keys = d.credit_by_key || [];
+    $('usCreditBody').innerHTML = keys.map(row => {
+      const id = String(row.key || '');
+      // 未归因那行给一句解释，避免被读成"有把叫未归因的 Key"。
+      const sub = row.nickname
+        ? esc(row.nickname) + (id && id !== '(未归因)' ? ' · ' + esc(id) : '')
+        : (id === '(未归因)' ? '未启用鉴权的放行请求 / 旧数据' : '');
+      return '<tr>' +
+        '<td class="mark" aria-hidden="true"></td>' +
+        '<td>' + esc(id || '—') + (sub ? '<div class="note">' + sub + '</div>' : '') + '</td>' +
+        '<td class="num">' + fmtTok(row.requests) + '</td>' +
+        '<td class="num">' + fmtCredit(row.credits) + '</td>' +
+        '<td class="num">' + fmtTok(row.credit_tokens) + '</td>' +
+        '<td class="num">' + fmtCreditRatio(row.credits_per_1m_tokens, row.credit_samples, row.credit_tokens) + '</td>' +
+        '<td class="num">' + cacheRateCell(row.cache_hit_tokens, row.cache_miss_tokens) + '</td>' +
+        '</tr>';
+    }).join('') || '<tr><td colspan="7" class="empty">' + empty + '</td></tr>';
   } else {
     const accounts = d.credit_by_account || [];
     $('usCreditBody').innerHTML = accounts.map(row => {
@@ -1999,9 +2816,10 @@ function renderCreditDim() {
         '</tr>';
     }).join('') || '<tr><td colspan="7" class="empty">' + empty + '</td></tr>';
   }
-  $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, {
+  $('usCreditTabs').innerHTML = usTabsHtml(US_CREDIT_TABS, usCreditDim, {
     account: (d.credit_by_account || []).length,
     model: (d.credit_by_model || []).length,
+    key: (d.credit_by_key || []).length,
   });
 }
 
@@ -2291,6 +3109,12 @@ async function warmUsageModelRates() {
 
 async function loadUsage() {
   const q = trangeQuery('usRange', true);
+  // 加载骨架：首次进入（还没有数据）时给出 KPI + 图表的形状，避免空白期像卡死。
+  if (!usageData) {
+    $('usStats').innerHTML = skelKpis(6);
+    $('usCreditStats').innerHTML = skelKpis(4);
+    $('usChart').innerHTML = loadingMsg('正在读取用量…');
+  }
   try {
     await warmUsageModelRates();
     const d = await api('usage?' + q.toString());
@@ -2298,7 +3122,8 @@ async function loadUsage() {
   } catch (e) {
     // 失败时三块都要清干净：只改图表会留下上一次窗口的数字，看起来像"刷新成功"。
     usageData = null;
-    $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
+    // 错误态就地给出重试入口（此前只有一行字，重试要滚回顶部找「刷新」）。
+    $('usChart').innerHTML = loadErrorHTML('读取用量失败', e.message, '重试');
     $('usChartNote').textContent = '—';
     $('usStats').innerHTML = '';
     $('usCreditStats').innerHTML = '';
@@ -2308,13 +3133,76 @@ async function loadUsage() {
     $('usDimHead').innerHTML = '';
     $('usCreditHead').innerHTML = '';
     $('usDimTabs').innerHTML = usTabsHtml(US_DIM_TABS, usDim, null);
-    $('usCreditTabs').innerHTML = usTabsHtml([['account', '按账号'], ['model', '按模型']], usCreditDim, null);
+    $('usCreditTabs').innerHTML = usTabsHtml(US_CREDIT_TABS, usCreditDim, null);
     $('usDimBody').innerHTML = '<tr><td colspan="10" class="empty">读取用量失败</td></tr>';
     $('usCreditBody').innerHTML = '<tr><td colspan="7" class="empty">读取用量失败</td></tr>';
+    bindRetry($('usChart'), loadUsage);
   }
 }
 
+/* bindRetry 给「就地重试」按钮挂回调（容器内 [data-retry] 按钮）。
+   每个视图的加载函数在错误分支调一次；按钮是一次性的（重建即重新绑定）。 */
+function bindRetry(host, fn) {
+  if (!host) return;
+  const b = host.querySelector('[data-retry]');
+  if (b) b.onclick = () => fn();
+}
+
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
+// 用量明细导出：与屏幕同口径（当前维度 + 当前排序）。
+if ($('btnUsExport')) $('btnUsExport').onclick = () => {
+  const d = usageData || {};
+  const m = US_DIMS[usDim] || US_DIMS.account;
+  const rows = usSortRows(d[m.key] || [], usSort);
+  if (!rows.length) { toast('当前维度没有可导出的数据', 'err'); return; }
+  const headers = ['维度', m.title, '域', '请求', '失败', 'Prompt', 'Completion', '合计Token', '均延迟ms', '均速率tok/s'];
+  const dimLabel = { account: '账号', model: '模型', realm: '域', key: 'API Key' }[usDim] || usDim;
+  const out = rows.map(x => [
+    dimLabel,
+    usDim === 'account' ? String(x.key || '').slice(0, 8) : (x.key || ''),
+    x.realm || '', x.requests || 0, x.errors || 0,
+    x.prompt_tokens || 0, x.completion_tokens || 0, x.total_tokens || 0,
+    Math.round(x.avg_latency_ms || 0), (x.avg_tokens_per_second || 0).toFixed(1),
+  ]);
+  exportCSV(headers, out, 'usage-' + dimLabel + '-' + exportStamp() + '.csv');
+  toast('已导出 ' + out.length + ' 行用量明细', 'ok');
+};
+// 积分扣除导出：与屏幕同口径（当前维度）。
+if ($('btnCreditExport')) $('btnCreditExport').onclick = () => {
+  const d = usageData || {};
+  let headers, out, dimLabel;
+  if (usCreditDim === 'model') {
+    dimLabel = '按模型';
+    headers = ['模型', '积分倍率', '请求', '扣除积分', '有效样本Token', '积分/1M Token', '缓存命中率%'];
+    out = (d.credit_by_model || []).map(r => [
+      r.key || '', fmtModelRate(r.rate), r.requests || 0, r.credits || 0,
+      r.credit_tokens || 0,
+      r.credit_samples ? Number(r.credits_per_1m_tokens || 0).toFixed(4) : '',
+      (r.cache_hit_tokens + r.cache_miss_tokens) ? cacheRateText(r.cache_hit_tokens, r.cache_miss_tokens).replace('%', '') : '',
+    ]);
+  } else if (usCreditDim === 'key') {
+    dimLabel = '按Key';
+    headers = ['API Key', '名称', '请求', '扣除积分', '有效样本Token', '积分/1M Token', '缓存命中率%'];
+    out = (d.credit_by_key || []).map(r => [
+      r.key || '', r.nickname || '', r.requests || 0, r.credits || 0,
+      r.credit_tokens || 0,
+      r.credit_samples ? Number(r.credits_per_1m_tokens || 0).toFixed(4) : '',
+      (r.cache_hit_tokens + r.cache_miss_tokens) ? cacheRateText(r.cache_hit_tokens, r.cache_miss_tokens).replace('%', '') : '',
+    ]);
+  } else {
+    dimLabel = '按账号';
+    headers = ['账号', '昵称', '域', '请求', '扣除积分', '有效样本Token', '积分/1M Token', '缓存命中率%'];
+    out = (d.credit_by_account || []).map(r => [
+      String(r.key || '').slice(0, 8), r.nickname || '', r.realm || '', r.requests || 0,
+      r.credits || 0, r.credit_tokens || 0,
+      r.credit_samples ? Number(r.credits_per_1m_tokens || 0).toFixed(4) : '',
+      (r.cache_hit_tokens + r.cache_miss_tokens) ? cacheRateText(r.cache_hit_tokens, r.cache_miss_tokens).replace('%', '') : '',
+    ]);
+  }
+  if (!out.length) { toast('当前维度没有可导出的积分记录', 'err'); return; }
+  exportCSV(headers, out, 'credits-' + dimLabel + '-' + exportStamp() + '.csv');
+  toast('已导出 ' + out.length + ' 行积分记录', 'ok');
+};
 // 时间范围控件绑定：任何改动（预设切换 / 自定义起止）都重新拉一次用量。
 if ($('usRange')) trangeBind('usRange', loadUsage);
 
@@ -2745,12 +3633,13 @@ async function loadPackages(force) {
     if (ageMin > 0) $('pkNote').textContent = lastPackages.accounts.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，点「刷新」更新';
     return;
   }
-  $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
+  // 加载骨架：逐账号查上游可能几十秒，卡片骨架比一行字更能表达"在加载"。
+  $('pkSummary').innerHTML = skelCards(4);
+  $('pkExpiry').innerHTML = loadingMsg('正在逐账号查询上游积分…');
   $('pkDetail').innerHTML = '';
-  $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">查询中…</div>';
   try {
     const [d, c] = await Promise.all([
-      api('packages'),
+      api('packages', { signal: abortable('packages').signal }),
       api('config').catch(() => null),
     ]);
     lastPackages = d;                            // 缓存供首页到期卡片与排序切换复用
@@ -2758,8 +3647,13 @@ async function loadPackages(force) {
     lastDetailLimit = pkDetailLimit(c && c.config);
     renderPackages(d, lastDetailLimit);
   } catch (e) {
-    $('pkSummary').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
-    $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">读取失败：' + esc(e.message) + '</div>';
+    // 被下一轮 abort（慢响应作废）：静默返回。loadPackages 会被轮询/多入口触发，
+    // 旧数据后到会覆盖新数据——abortable 保证只有最新一轮写 UI。
+    if (isAbort(e)) return;
+    // 就地重试（此前只有一行字，重试要滚回顶部找「刷新」）。
+    $('pkSummary').innerHTML = loadErrorHTML('读取积分构成失败', e.message, '重试');
+    $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">读取失败</div>';
+    bindRetry($('pkSummary'), () => loadPackages(true));
   }
 }
 

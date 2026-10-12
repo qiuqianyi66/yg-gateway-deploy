@@ -80,10 +80,14 @@ type Event struct {
 	HasCredit        bool      `json:"credit_known"`
 	// CacheHitTokens / CacheMissTokens 上游前缀缓存命中/未命中 token（issue #92）。
 	// 上游未回该维度时两者皆零值省略；hit=0 + miss>0 即整段未命中。
-	CacheHitTokens  int64 `json:"cache_hit_tokens,omitempty"`
-	CacheMissTokens int64 `json:"cache_miss_tokens,omitempty"`
-	ClientIP         string    `json:"client_ip,omitempty"`
-	UserAgent        string    `json:"user_agent,omitempty"`
+	CacheHitTokens  int64  `json:"cache_hit_tokens,omitempty"`
+	CacheMissTokens int64  `json:"cache_miss_tokens,omitempty"`
+	ClientIP        string `json:"client_ip,omitempty"`
+	UserAgent       string `json:"user_agent,omitempty"`
+	// KeyID / KeyName 鉴权命中的下游 Key 身份（多 Key 派发归因，ADR-001 F-005）。
+	// 只存短稳定 id 与展示名，不存 Key 明文、不存 Authorization 原文（R1/R2）。
+	KeyID   string `json:"key_id,omitempty"`
+	KeyName string `json:"key_name,omitempty"`
 }
 
 // Filter 用于从归档中筛选最近记录。字符串字段一律「包含」匹配（大小写不敏感），
@@ -132,7 +136,12 @@ type Recorder struct {
 	succeeded   int64
 	httpSuccess int64
 	durationSum int64
-	recent      []Event
+	// recent 定长环形缓冲（容量恒为 recentLimit），recentHead 是下一个写入位、
+	// recentCount 是已填充条数。用「数组 + 写指针」而不是切片前插，避免每记录
+	// 一条就整体拷贝（见 Record 注释）。
+	recent      [recentLimit]Event
+	recentHead  int
+	recentCount int
 	archive     *archiveWriter
 }
 
@@ -144,7 +153,8 @@ func New(cfg Config) *Recorder {
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = defaultQueue
 	}
-	r := &Recorder{started: time.Now(), recent: make([]Event, 0, recentLimit)}
+	// recent 是定长数组字段，零值即已分配，无需 make（用切片才需要）。
+	r := &Recorder{started: time.Now()}
 	r.archive = newArchiveWriter(cfg)
 	return r
 }
@@ -186,14 +196,34 @@ func (r *Recorder) Record(e Event) {
 		r.httpSuccess++
 	}
 	r.durationSum += e.DurationMs
-	r.recent = append([]Event{e}, r.recent...)
-	if len(r.recent) > recentLimit {
-		r.recent = r.recent[:recentLimit]
+	// 环形缓冲：定长数组 + 写指针，零分配零拷贝。
+	//
+	// 此前是 r.recent = append([]Event{e}, r.recent...)——每记录一条就新建切片
+	// 并整体拷贝至多 100 条 Event（含多个字符串字段），是热路径上的 O(n) 分配。
+	r.recent[r.recentHead] = e
+	r.recentHead = (r.recentHead + 1) % recentLimit
+	if r.recentCount < recentLimit {
+		r.recentCount++
 	}
 	r.mu.Unlock()
 	if r.archive != nil {
 		r.archive.enqueue(e)
 	}
+}
+
+// recentEvents 按「时间降序（最近在前）」导出环形缓冲，供 Snapshot 展示。
+// 调用方须持有 r.mu。
+func (r *Recorder) recentEvents() []Event {
+	if r.recentCount == 0 {
+		return []Event{}
+	}
+	out := make([]Event, 0, r.recentCount)
+	// 从写指针前一位（最新）往回走 r.recentCount 步。
+	for i := 0; i < r.recentCount; i++ {
+		idx := (r.recentHead - 1 - i + recentLimit) % recentLimit
+		out = append(out, r.recent[idx])
+	}
+	return out
 }
 
 // Snapshot 返回进程内指标和归档状态。
@@ -207,7 +237,7 @@ func (r *Recorder) Snapshot() Snapshot {
 		Completed: r.completed,
 		InFlight:  r.inFlight,
 		Succeeded: r.succeeded,
-		Recent:    append([]Event(nil), r.recent...),
+		Recent:    r.recentEvents(),
 	}
 	if r.completed > 0 {
 		s.Failed = r.completed - r.succeeded

@@ -195,17 +195,45 @@ func (p *Panel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.mux.ServeHTTP(w, r)
 }
 
-// withAuth 与 server 包同口径的 Bearer 鉴权（经 httpauth 常量时间比较）；
-// api_key 为空时放行。密钥经 livecfg 快照读取：面板里改了 api_key，下一个请求
-// 即用新值（无需重启）。
+// withAuth 面板 Bearer 鉴权。与 server 包**不同口径**：面板只认「管理员凭证」
+// （单 api_key），不认 api_keys 里的普通下游 Key（阻断项 3：普通 Key 只用于网关 API，
+// 不应获得面板的账号管理/配置读写等完整权限）。
+// 密钥经 livecfg 快照读取：面板里改了 api_key，下一个请求即用新值（无需重启）。
 func (p *Panel) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, p.apiKey()) {
+		if !p.authenticateAdmin(r) {
 			writeErr(w, http.StatusUnauthorized, "invalid_api_key")
 			return
 		}
 		next(w, r)
 	}
+}
+
+// authenticateAdmin 面板管理员鉴权：只认单 api_key（Live 优先，回落静态）。
+// 不认多 Key——普通下游 Key 不能访问面板（阻断项 3）。
+//
+// 空 api_key 的行为按配置状态区分（阻断项 2，第二轮）：
+//   - 旧版配置（无多 Key 索引）且 api_key 空 → 放行（2.0.0 旧语义，兼容）
+//   - 多 Key 已启用（AuthIndex 非 nil）且 api_key 空 → **拒绝**（fail closed）
+//     不能因为管理员密钥为空，就把管理面板开放给匿名访问。
+func (p *Panel) authenticateAdmin(r *http.Request) bool {
+	key := p.apiKey()
+	multiEnabled := p.multiKeyEnabled()
+	if key == "" {
+		if multiEnabled {
+			return false // 多 Key 模式下管理员密钥为空：拒绝匿名访问（fail closed）
+		}
+		return true // 旧版兼容：无多 Key 且 api_key 空 → 放行（2.0.0 旧语义）
+	}
+	return httpauth.VerifyBearer(r, key)
+}
+
+// multiKeyEnabled 是否启用了多 Key 鉴权（Live 优先，回落静态判断）。
+func (p *Panel) multiKeyEnabled() bool {
+	if p.cfg.Live != nil {
+		return p.cfg.Live.Load().AuthIndex != nil
+	}
+	return false // Live 为 nil（测试/裸用）时无多 Key
 }
 
 // apiKey 当前生效密钥（Live 优先，回落静态字段）。
@@ -214,6 +242,17 @@ func (p *Panel) apiKey() string {
 		return p.cfg.Live.Load().APIKey
 	}
 	return p.cfg.APIKey
+}
+
+// authEnabled 是否启用了鉴权（单 Key 或多 Key 任一非空）。
+// 注意：面板鉴权本身只看单 api_key（见 authenticateAdmin），这里仍报「多 Key 也需
+// 鉴权」是因为网关 API 侧多 Key 已启用鉴权；面板 auth_required 用于前端提示。
+func (p *Panel) authEnabled() bool {
+	if p.cfg.Live != nil {
+		snap := p.cfg.Live.Load()
+		return snap.AuthIndex != nil || snap.APIKey != ""
+	}
+	return p.cfg.APIKey != ""
 }
 
 // expiringSoonWindow 返回调度器当前生效的快过期路由窗口；测试面板无调度器时返回 0。
@@ -240,7 +279,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
-		"auth_required":   p.apiKey() != "",
+		"auth_required":   p.authEnabled(),
 		"redis_mode":      p.cfg.RedisMode,
 		"sticky_sessions": sticky,
 		"total":           total,
@@ -748,11 +787,37 @@ func (p *Panel) usage(w http.ResponseWriter, r *http.Request) {
 			nicks[s.UID] = s.Nickname
 		}
 	}
+	// 下游 Key 的 ID→展示名（用量按 Key 聚合用）。只取 id/name 两个展示字段，
+	// 摘要与明文都不外泄（httpauth.Key 本身就不含明文）。
+	keyNames := p.keyNameMap()
 	var currentRate func(realm, model string) string
 	if p.cfg.Upstream != nil {
 		currentRate = p.cfg.Upstream.ModelRate
 	}
-	writeJSON(w, http.StatusOK, p.cfg.Usage.SnapshotWindow(win, nicks, currentRate))
+	writeJSON(w, http.StatusOK, p.cfg.Usage.SnapshotWindow(win, nicks, keyNames, currentRate))
+}
+
+// keyNameMap 当前生效的下游 Key ID→展示名映射（livecfg 快照，无明文）。
+// 单 api_key 合成身份（ID="single"）归入映射并给出可读名，让用量页的「按 Key」
+// 维度对最常见的单 Key 部署也有意义。
+func (p *Panel) keyNameMap() map[string]string {
+	out := map[string]string{}
+	if p.cfg.Live == nil {
+		return out
+	}
+	snap := p.cfg.Live.Load()
+	for i := range snap.APIKeys {
+		k := snap.APIKeys[i]
+		if k.ID != "" {
+			out[k.ID] = k.Name
+		}
+	}
+	if snap.APIKey != "" {
+		if _, ok := out[httpauth.SingleKeyID]; !ok {
+			out[httpauth.SingleKeyID] = "管理员密钥（单 api_key）"
+		}
+	}
+	return out
 }
 
 // parseTimeParam 解析时间查询参数：unix 秒（前端默认）或 RFC3339（便于手工调

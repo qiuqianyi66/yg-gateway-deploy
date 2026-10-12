@@ -1,8 +1,6 @@
 # YG Gateway
 
-自托管的 **OpenAI 兼容反向代理网关**：把腾讯 CodeBuddy 账号池包装成统一的 `/v1/chat/completions` 服务，附带 Web 管理面板与全自动养号。
-
-本项目从 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) v1.13.0 独立而来，此后自行演进、不再跟随上游。原始项目链：`Sliverkiss/workbuddy2api`（已删库）→ `linguo2625469/workbuddy2api-panel` → 本仓库。MIT 协议，版权声明见 [LICENSE](LICENSE)。
+自托管的 **OpenAI 兼容反向代理网关**：把腾讯 CodeBuddy 账号池包装成统一的 `/v1/chat/completions` 服务，附带 Web 管理面板与全自动养号。MIT 协议，版权声明见 [LICENSE](LICENSE)。
 
 ---
 
@@ -21,30 +19,7 @@
 
 ---
 
-## 与上游的关系
-
-| | 说明 |
-|---|---|
-| **继承了什么** | 全部底层能力：账号池调度、错误分类、提示词体系、出站指纹、成长任务逆向、面板本体 |
-| **改了什么** | module 名、产品身份标识、版本号起点、构建工具链、部署命名 |
-| **没改什么** | 上游协议数据（`wb2api-<ms>` 形式的 conversationId、`chatcmpl-wb2api` 哨兵）——它们是发给上游的报文内容，改名无收益且有风控风险 |
-| **是否同步上游** | 不再自动同步。上游有价值的修复会手工挑选合入 |
-
-### 独立化改动清单
-
-| 类别 | 改前 | 改后 |
-|---|---|---|
-| Go module | `github.com/linguo2625469/workbuddy2api-panel` | `yg-gateway` |
-| `/healthz` service 字段 · `X-Service` 头 | `workbuddy2api` | `yg-gateway` |
-| 启动日志前缀 | `workbuddy2api listening on ...` | `yg-gateway listening on ...` |
-| 面板标题 / 品牌 | `WorkBuddy2API · 控制台` | `YG Gateway · 控制台` |
-| 版本号起点 | `1.13.0-panel` | `2.0.0` |
-| 二进制名 | `wb2api[.exe]` | `yg-gateway[.exe]` |
-| 容器名 | `workbuddy2api` | `yg-gateway` |
-| Redis key 前缀 | `wb2api:` | `yg-gateway:` |
-| 面板 localStorage key | `wb2api.key` / `wb2api.theme` | `yg-gateway.key` / `yg-gateway.theme` |
-| Go 构建版本 | 1.22.5（含 9 个标准库漏洞） | **1.27.2**（`govulncheck` 零告警） |
-| 到期提醒卡片 | 初始 `hidden` + 仅点「检查」才渲染 → 死锁不可达 | 默认可见 + overview 快照即时渲染（零上游请求） |
+## 构建要求
 
 > **Go 版本不是小事**：1.27.0 及更早带 9 个标准库漏洞（GO-2026-6603/6605/6607/6608/6610-6613/6617，覆盖 `net/http`、HTTP/2 实现与 `crypto/tls`），修复版本正是 1.27.2。对一个整天发 HTTPS 出站请求的网关，这处在最要害的位置。**构建必须 ≥1.27.2。**
 
@@ -113,6 +88,16 @@ powershell -ExecutionPolicy Bypass -File .\lock-auths.ps1
 
 （用 `icacls` 而非 `Set-Acl`：后者在对象带 SACL 时需要 `SeSecurityPrivilege`，非提升进程会报 `PrivilegeNotHeld`。）
 
+> ⚠️ **这是最容易忘的一步**：面板新加的账号会重新带上继承 ACL，即使之前跑过脚本。
+> 用下面这条确认当前状态（应只剩你自己 + `SYSTEM`）：
+>
+> ```powershell
+> (Get-Acl .\auths\*.json).AccessToString
+> ```
+>
+> 若输出里出现 `BUILTIN\Users` 或 `Authenticated Users`，说明没加固——此时本机任意
+> 登录用户都能读到明文 token 并冒用账号。
+
 ### 2. 只监听本机
 
 `listen` 保持 `127.0.0.1:7863`。默认的 `:7863` 等同 `0.0.0.0`，会暴露到局域网。
@@ -135,6 +120,51 @@ go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 
 ---
 
+## 调度可靠性配置（可选）
+
+两个默认关闭/保守的参数，按需开启。都在面板「配置」页可改，**热生效、无需重启**。
+
+### `pool.global_max_in_flight`（默认 `0` = 不限）
+
+全网关在途请求总数上限。超限**立即返回 429 + `Retry-After`**（不排队）。
+
+上游变慢时请求会堆积（每个都占着 goroutine 与连接等超时），这是防雪崩的一道闸。
+**默认 0 = 不限**（保持旧行为），推荐值 ≈ `账号数 × max_in_flight × 1.5`：
+
+```json
+"pool": { "max_in_flight": 3, "global_max_in_flight": 18 }
+```
+
+触顶情况可在 `/status` 的 `global_in_flight` 字段观察。
+
+### `pool.breaker_probe_gap`（默认 `"30s"`）
+
+熔断到期后的 **half-open 试探间隔**。熔断号到期后不再一次性全量放回，而是每该间隔
+至多放行 1 次试探：
+
+- 试探**成功** → 全量恢复（清 `retryCount`，不再限速）
+- 试探**失败** → 重新熔断，且退避指数 +1（下次禁得更久）
+
+这避免了「到期瞬间洪峰把还是坏的号二次打挂」——二次熔断会让它多禁一个指数周期
+（最长 6h）。设 `"0"` 关闭（退化为到期即全量，与旧行为一致）。
+
+### 延迟分位数观测
+
+`/status` 的 `latency` 段给出**全局 + 按模型**的 P50/P90/P95/P99：
+
+```json
+"latency": {
+  "global": { "count": 128, "p50_ms": 1750, "p95_ms": 2500, "p99_ms": 30000 },
+  "by_model": { "glm-5.2": { "p50_ms": 1750, "count": 128 } }
+}
+```
+
+均值会被大量快请求稀释（一个 60s 超时在 1000 个 50ms 请求里几乎看不见），
+分位数才能反映真实体感。自实现固定分桶（`internal/metrics`），零新依赖；
+重启归零（是近期健康度，不是历史账本）。
+
+---
+
 ## 已加固 / 已审计项
 
 | 项 | 状态 |
@@ -146,7 +176,7 @@ go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 | 日志脱敏 | 归档 JSONL 不含提示词、响应正文、Authorization；`state.json` 仅用量统计 |
 | XSS | `esc()` 转义 `& < > " '` 五字符；渲染函数实测 4 种 payload 注入均安全 |
 | 遥测 / 回连 | **无**——无版本检查、无激活校验、无埋点，唯一外部依赖是可选 Redis |
-| 依赖 | 仅 12 个模块，`govulncheck` 零告警 |
+| 依赖 | 仅 5 个模块（1 直接 + 4 传递，全部来自可选的 go-redis），`govulncheck` 零告警 |
 
 ---
 
@@ -155,15 +185,20 @@ go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 | 能力 | 说明 |
 |---|---|
 | 多账号池 | 快过期积分加权 ×3、实测成本分层、加权随机选号、防惊群 |
-| 熔断与冷却 | 402 硬冷却至次日 04:00、429 软冷却 600s 起指数退避（封顶 2h）、连续失败熔断、在途租约限流 |
+| 熔断与冷却 | 402 硬冷却至次日 04:00、429 软冷却 600s 起指数退避（封顶 2h）、连续失败熔断 + **half-open 试探**（到期后限速放行 1 次，避免洪峰二次打挂）、在途租约限流 |
+| 全局准入 | `pool.global_max_in_flight` 在途总数上限，超限立即 429 + `Retry-After`（防上游慢时请求堆积） |
 | 会话粘性 | 同一会话绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis |
 | 全自动养号 | 签到 09/21、活跃上报 10、猫猫旅行 09/21、token 保活 22、夜猫子 23，五类独立开关 |
 | 连登管家 | 签到末尾自动兑换已解锁档位并抽完抽奖次数 |
 | 成长任务 | 17/18 个任务纯 API 一键完成，新号一轮约 +1950 积分 +78 能量 |
 | 积分保底 | `pool.credit_floor` 防止收费模型把余额打穿 |
 | 提示词体系 | 网关提示词替换客户端 system，从源头消灭内容审核误报；`passthrough` 遇拦截自动降级重试 |
-| 原生工具调用还原 | DeepSeek 系标记文本还原为结构化 `tool_calls`（上游 PR #123） |
-| 面板 | 七视图：账号池 / 用量 / 积分构成 / 任务中心 / 模型档位 / 配置（热生效）/ 运行日志 |
+| 原生工具调用还原 | DeepSeek 系标记文本还原为结构化 `tool_calls` |
+| 多 API Key | 每把 Key 带 `id` / `models` 白名单 / `realm` 约束；摘要前缀索引 + 常量时间比较；面板可视化管理、热生效 |
+| 面板 | 八视图：账号池 / 用量 / 积分构成 / 任务中心 / 模型档位 / API Key / 配置（热生效）/ 运行日志 |
+| 用量归因 | 按域 / 账号 / 模型 / **下游 Key** 四个维度聚合，含积分扣除与缓存命中率 |
+| 延迟观测 | 全局 + 按模型的 P50/P90/P95/P99（自实现固定分桶，零新依赖）；均值看不见的长尾由此可见 |
+| 导出 | 请求记录 / 用量明细 / 积分扣除可一键导出 CSV（带 BOM，Excel 直接打开） |
 
 ---
 
@@ -172,7 +207,7 @@ go run golang.org/x/vuln/cmd/govulncheck@latest ./...
 ```bash
 go build ./...
 go vet ./...
-go test ./...        # 完整测试套件（19 包）
+go test ./...        # 完整测试套件（20 包：17 有测试 + 3 个 CLI 无测试）
 gofmt -l ./cmd ./internal
 node --check internal/panel/app.js
 ```

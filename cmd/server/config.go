@@ -12,15 +12,45 @@ import (
 	"strings"
 	"time"
 
+	"yg-gateway/internal/httpauth"
 	"yg-gateway/internal/prompt"
 )
 
 // Config 顶层配置。
+// defaultBreakerProbeGap 熔断 half-open 试探间隔缺省值（ADR-003 D-400）。
+// 30s：坏号被重新熔断前的最大暴露窗口，同时给"已恢复的好号"足够快的回归速度。
+const defaultBreakerProbeGap = "30s"
+
+// defaultEwmaAlpha / defaultEwmaMinSamples pool.ewma 缺省值（ADR-005 D-502）。
+// 必须与 internal/pool entry.go 的 defaultEwmaAlpha / defaultEwmaMinSamples 一致。
+const (
+	defaultEwmaAlpha      = 0.1
+	defaultEwmaMinSamples = 5
+)
+
+// EwmaConfig pool.ewma 配置段（ADR-005 D-502）。
+// 默认全关/回落默认：键缺席时 Enabled=false、Alpha/MinSamples 回落默认，
+// 与「未配置 = 现状行为」逐位一致。
+type EwmaConfig struct {
+	Enabled    bool    `json:"enabled"`     // true = 成功率/延迟信号参与选号加权；默认 false
+	Alpha      float64 `json:"alpha"`       // EWMA 平滑系数 (0,1]；0 = 回落默认 0.1
+	MinSamples int     `json:"min_samples"` // 每账号样本下限；<=0 = 回落默认 5
+}
+
 type Config struct {
 	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
+	APIKey    string `json:"api_key"`    // 空 = 不鉴权（单 Key 兼容）
 	AuthDir   string `json:"auth_dir"`   // ./auths
 	StateFile string `json:"state_file"` // ./data/state.json
+	// APIKeys 多 Key 鉴权（ADR-001）。nil = 键缺失/null（旧版兼容，单 Key 语义）；
+	// 非 nil 空切片 = 显式空数组（配置错误，normalize fail fast）。
+	// 每个条目的 Key 明文只在配置源；运行时索引只存摘要（见 httpauth.Index）。
+	// omitempty：WriteDefault 生成默认配置时不输出 api_keys（避免生成 "api_keys":null
+	// 又被 Load 判成 fail fast 的显式 null——阻断项 4 修复引入的回归）。
+	APIKeys []APIKeyConfig `json:"api_keys,omitempty"`
+	// apiKeysFieldSet 记录 JSON 里是否显式出现了 api_keys 键（区分「键缺失」与「显式 null」）。
+	// json:"-" 不参与序列化；由 ParseConfigInto 在 unmarshal 前探测原始 JSON 设置。
+	apiKeysFieldSet bool `json:"-"`
 
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
@@ -192,8 +222,7 @@ type Config struct {
 
 	// PromptText 解析后的系统提示词文本（custom/append 模式使用）。
 	PromptText string `json:"-"`
-
-	Upstash struct {
+	Upstash    struct {
 		URL   string `json:"url"`   // 空 = 纯内存模式；支持完整 rediss:// URL 或 https://xxx.upstash.io host
 		Token string `json:"token"` // url 非完整连接串时用于组装 rediss://default:<token>@<host>:6379
 	} `json:"upstash"`
@@ -204,6 +233,15 @@ type Config struct {
 		BreakerThreshold   int    `json:"breaker_threshold"`    // 连续失败次数触发熔断，默认 3
 		BreakerCooldown    string `json:"breaker_cooldown"`     // 基础熔断时长，默认 "30m"
 		BreakerCooldownMax string `json:"breaker_cooldown_max"` // 指数退避封顶，默认 "6h"
+		// BreakerProbeGap 熔断到期后的 half-open 试探间隔（ADR-003 D-400）。
+		// 熔断号到期后不再一次性全量放回，而是每该间隔至多放行 1 次试探；
+		// 成功即全量恢复、失败则重新熔断（退避加倍）。默认 "30s"；"0" 关闭
+		// half-open（退化为「到期即全量」，与旧行为逐位一致）。
+		BreakerProbeGap string `json:"breaker_probe_gap"`
+		// GlobalMaxInFlight 全网关在途请求总数上限（ADR-003 D-401）：超限立即
+		// 429（不排队），防上游慢时请求无限堆积。默认 0 = 不限（保持旧行为）。
+		// 建议按「账号数 × max_in_flight」的 ~1.5 倍设置。
+		GlobalMaxInFlight int `json:"global_max_in_flight"`
 		// 连败降权（issue #114）：ErrClient/传输层这类「不罚号」失败连续计数，达阈
 		// 临时出池。与冷却/熔断并存取更长者不叠加。默认 5 次 / 10m。
 		DegradeThreshold   int     `json:"degrade_threshold"`    // 连败次数触发降权，默认 5
@@ -231,23 +269,37 @@ type Config struct {
 		// tier 0（免费）/ tier 1（无观测）不受限；签到回血越过 floor 自动恢复。
 		// 默认 0 = 关闭；负值钳 0。
 		CreditFloor int64 `json:"credit_floor"`
+		// Ewma 成功率/延迟 EWMA 表现回灌（ADR-005 D-502）：把「最近表现」参与
+		// 选号加权。默认关闭（零回归）；开启后因子被钳制在温和区间，不会把账号
+		// 权重清零（饿死防护）。字段均热生效（SetEwma），改配置无需重启。
+		Ewma EwmaConfig `json:"ewma"`
 	} `json:"pool"`
 
 	SessionSticky struct {
 		Enabled    bool   `json:"enabled"`     // 默认 true
 		TTL        string `json:"ttl"`         // 会话绑定 TTL，默认 "30m"
 		GCInterval string `json:"gc_interval"` // 会话 GC 周期，默认 "5m"
+		// Derive 内容派生会话键开关（默认 true = 保持既有行为）。
+		// 用 *bool 三态：nil（键缺失）= 默认 true，显式 false = 关闭派生。
+		// 关闭后只有客户端显式给 conversation_id/conversationId/prompt_cache_key
+		// 才粘性；其余回落纯加权轮换（防"固定 system + 短开场"把无关对话
+		// 误判为同一会话、全量钉到同一个账号）。
+		Derive *bool `json:"derive"`
 	} `json:"session_sticky"`
 
 	// 解析后
-	SoftRateDur            time.Duration `json:"-"`
-	SoftRateMaxDur         time.Duration `json:"-"`
-	BreakerCooldownDur     time.Duration `json:"-"`
-	BreakerCooldownMaxD    time.Duration `json:"-"`
-	DegradeCooldownDur     time.Duration `json:"-"`
-	DegradeCooldownMaxD    time.Duration `json:"-"`
-	SessionTTL             time.Duration `json:"-"`
-	SessionGCInterval      time.Duration `json:"-"`
+	SoftRateDur         time.Duration `json:"-"`
+	SoftRateMaxDur      time.Duration `json:"-"`
+	BreakerCooldownDur  time.Duration `json:"-"`
+	BreakerCooldownMaxD time.Duration `json:"-"`
+	// BreakerProbeGapDur 解析后的 half-open 试探间隔（ADR-003 D-400）；0 = 关闭。
+	BreakerProbeGapDur  time.Duration `json:"-"`
+	DegradeCooldownDur  time.Duration `json:"-"`
+	DegradeCooldownMaxD time.Duration `json:"-"`
+	SessionTTL          time.Duration `json:"-"`
+	SessionGCInterval   time.Duration `json:"-"`
+	// SessionStickyDerive 解析后的内容派生会话键开关（默认 true）。
+	SessionStickyDerive    bool          `json:"-"`
 	BalanceRefreshInterval time.Duration `json:"-"` // 0 = 不启动（enabled=false）
 	ExpiringSoonDur        time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
@@ -259,6 +311,23 @@ type Config struct {
 	// MaxBodyBytesEffective 解析后的 body 上限（F-001）：nil（未配置）回落默认 64MB，
 	// 显式 0 = 不限（0 传给 handler 表示关闭 MaxBytesReader）。
 	MaxBodyBytesEffective int64 `json:"-"`
+}
+
+// APIKeyConfig 一把多 Key 的配置形态（ADR-001 §三）。
+//
+// Key 是明文（配置源手填）；运行时转摘要（httpauth.BuildIndex）。Models 三态
+// 语义靠 Go slice 的 nil 区分（见 PRD v2 §三）：
+//
+//	nil（键缺失/null）      = 不限
+//	非 nil 空切片（显式 []） = 全拒
+//	非空                     = 白名单
+type APIKeyConfig struct {
+	ID      string   `json:"id"`      // 稳定身份标识，必填，[A-Za-z0-9_-] ≤64，不重复
+	Key     string   `json:"key"`     // 明文 Key；空条目 normalize 忽略
+	Name    string   `json:"name"`    // 展示名（可空）
+	Models  []string `json:"models"`  // 三态模型白名单
+	Realm   string   `json:"realm"`   // cn/global/空=不限；其他值 fail fast
+	Enabled *bool    `json:"enabled"` // 启停开关：nil/true=启用；false=禁用（不进鉴权索引，但保留在 config 里）
 }
 
 // Default 默认配置。
@@ -312,6 +381,11 @@ func Default() *Config {
 	c.Pool.BreakerThreshold = 3
 	c.Pool.BreakerCooldown = "30m"
 	c.Pool.BreakerCooldownMax = "6h"
+	// BreakerProbeGap 缺省 "30s"（ADR-003 D-400）：熔断到期后限速试探，避免
+	// 到期瞬间全量洪峰把坏号二次打挂（二次熔断会让退避翻倍、最长 6h）。
+	c.Pool.BreakerProbeGap = defaultBreakerProbeGap
+	// GlobalMaxInFlight 缺省 0 = 不限（ADR-003 D-401）：默认不改变既有行为。
+	c.Pool.GlobalMaxInFlight = 0
 	c.Pool.DegradeThreshold = 5
 	c.Pool.DegradeCooldown = "10m"
 	c.Pool.DegradeCooldownMax = "2h"
@@ -321,6 +395,9 @@ func Default() *Config {
 	c.Pool.ExpiringSoon = "168h" // 快过期窗口默认 7 天：官方活动奖励积分多在两周内过期
 	// costTier 探索默认 30m（issue #136：垄断破除 + 搭车改道零新增请求）；"0" 关停。
 	c.Pool.CostExploreInterval = "30m"
+	// EWMA 表现回灌默认关闭（ADR-005 D-502）：不改变既有行为；Alpha/MinSamples
+	// 默认值必须与 internal/pool entry.go 的 defaultEwma* 一致。
+	c.Pool.Ewma = EwmaConfig{Enabled: false, Alpha: defaultEwmaAlpha, MinSamples: defaultEwmaMinSamples}
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -356,6 +433,13 @@ func Load(path string) (*Config, error) {
 // ParseConfigInto 把 JSON 覆盖到 c 上并 normalize（不做 env、不读文件）。
 // 面板保存配置走这条路径：与 Load 完全同一套解析/校验逻辑，避免两处漂移。
 func ParseConfigInto(raw []byte, c *Config) (*Config, error) {
+	// 探测 api_keys 键是否显式出现（区分「键缺失」与「显式 null」，阻断项 4）。
+	var probe map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &probe); err == nil {
+		if _, ok := probe["api_keys"]; ok {
+			c.apiKeysFieldSet = true
+		}
+	}
 	if err := json.Unmarshal(raw, c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
@@ -484,6 +568,9 @@ func applyEnv(c *Config) {
 
 func (c *Config) normalize() error {
 	var err error
+	if err := c.normalizeAPIKeys(); err != nil {
+		return err
+	}
 	if c.Panel.PackageDetailLimit <= 0 {
 		c.Panel.PackageDetailLimit = 5
 	}
@@ -544,6 +631,17 @@ func (c *Config) normalize() error {
 	if c.BreakerCooldownMaxD, err = time.ParseDuration(c.Pool.BreakerCooldownMax); err != nil {
 		return fmt.Errorf("pool.breaker_cooldown_max: %w", err)
 	}
+	// half-open 试探间隔（ADR-003 D-400）："0" 合法（关闭），故不能沿用
+	// ParseDuration 直接失败——空串才回落默认。
+	if c.Pool.BreakerProbeGap == "" {
+		c.Pool.BreakerProbeGap = defaultBreakerProbeGap
+	}
+	if c.BreakerProbeGapDur, err = time.ParseDuration(c.Pool.BreakerProbeGap); err != nil {
+		return fmt.Errorf("pool.breaker_probe_gap: %w", err)
+	}
+	if c.BreakerProbeGapDur < 0 {
+		return fmt.Errorf("pool.breaker_probe_gap: 负值 %s 无意义（0=关闭）", c.Pool.BreakerProbeGap)
+	}
 	if c.DegradeCooldownDur, err = time.ParseDuration(c.Pool.DegradeCooldown); err != nil {
 		return fmt.Errorf("pool.degrade_cooldown: %w", err)
 	}
@@ -556,6 +654,9 @@ func (c *Config) normalize() error {
 	if c.SessionGCInterval, err = time.ParseDuration(c.SessionSticky.GCInterval); err != nil {
 		return fmt.Errorf("session_sticky.gc_interval: %w", err)
 	}
+	// 派生会话键三态（ADR-004）：键缺失/显式 true → 开（保持既有行为）；
+	// 显式 false → 关。nil 与 false 必须区分，故用 *bool。
+	c.SessionStickyDerive = c.SessionSticky.Derive == nil || *c.SessionSticky.Derive
 	// 快过期窗口：空 = 禁用（ExpiringSoonDur 0）；非空必须可解析（拼写错误 fail fast）。
 	if c.Pool.ExpiringSoon != "" {
 		if c.ExpiringSoonDur, err = time.ParseDuration(c.Pool.ExpiringSoon); err != nil {
@@ -581,6 +682,17 @@ func (c *Config) normalize() error {
 	// 积分保底：负值钳 0（= 关闭）。0 是合法默认（关闭），无需空值回落。
 	if c.Pool.CreditFloor < 0 {
 		c.Pool.CreditFloor = 0
+	}
+	// pool.ewma 归一（ADR-005 D-502）：alpha 0/负值回落默认、>1 报错；min_samples
+	// <=0 回落默认。enabled 无归一（bool 无非法态）。
+	if c.Pool.Ewma.Alpha <= 0 {
+		c.Pool.Ewma.Alpha = defaultEwmaAlpha
+	}
+	if c.Pool.Ewma.Alpha > 1 {
+		return fmt.Errorf("pool.ewma.alpha: 必须在 (0,1]，got %v", c.Pool.Ewma.Alpha)
+	}
+	if c.Pool.Ewma.MinSamples <= 0 {
+		c.Pool.Ewma.MinSamples = defaultEwmaMinSamples
 	}
 	if c.Pool.BreakerThreshold <= 0 {
 		c.Pool.BreakerThreshold = 3
@@ -650,6 +762,89 @@ func (c *Config) normalize() error {
 		return err
 	}
 	return c.normalizePrompt()
+}
+
+// normalizeAPIKeys 校验并归一化多 Key 配置（ADR-001 §四 空值语义 + §五 约束）。
+//
+// 空值语义（靠 Go slice 的 nil 区分，无需自定义反序列化）：
+//
+//	APIKeys == nil          → 键缺失（旧版兼容，跳过校验）
+//	APIKeys != nil && len 0 → 显式 []，配置错误 fail fast
+//	过滤空 key 条目后为 0     → 全空条目，配置错误 fail fast
+//
+// 阻断项 1（重复密钥）：同一个密钥值同时出现在 api_key（单值）与 api_keys[].key，
+// 或出现在两条多 Key 之间，会导致 Match 命中第一把 Key 而绕过另一把的 models/realm
+// 约束。这里**拒绝重复的有效密钥**，不静默合并约束、不依赖索引插入顺序。
+func (c *Config) normalizeAPIKeys() error {
+	// 键缺失：旧版兼容（无多 Key）。
+	if c.APIKeys == nil && !c.apiKeysFieldSet {
+		return nil
+	}
+	// 显式 null：按 PRD/ADR 契约 fail fast（不能静默降级为免鉴权，阻断项 4）。
+	if c.APIKeys == nil && c.apiKeysFieldSet {
+		return fmt.Errorf("api_keys: 显式 null 不是合法配置；要么删除该键（回到单 api_key），要么提供有效数组")
+	}
+	if len(c.APIKeys) == 0 {
+		return fmt.Errorf("api_keys: 显式空数组；要关闭多 Key 请删除该键（回到单 api_key），而不是配空数组")
+	}
+	seenID := map[string]bool{}
+	seenKey := map[string]string{}                      // 明文 key → id（重复检测）
+	filtered := make([]APIKeyConfig, 0, len(c.APIKeys)) // 新切片：append 不污染 c.APIKeys 底层数组
+	for _, k := range c.APIKeys {
+		key := strings.TrimSpace(k.Key)
+		if key == "" {
+			continue // 空 key 条目忽略
+		}
+		id := strings.TrimSpace(k.ID)
+		if id == "" {
+			return fmt.Errorf("api_keys[%s]: id 不能为空", k.ID)
+		}
+		if !validKeyID(id) {
+			return fmt.Errorf("api_keys[%s]: id 仅允许 [A-Za-z0-9_-] 且 ≤64 字符", id)
+		}
+		if id == httpauth.SingleKeyID {
+			return fmt.Errorf("api_keys[%s]: id %q 是保留名（旧版单 api_key 的合成身份），请换一个 id", id, httpauth.SingleKeyID)
+		}
+		if seenID[id] {
+			return fmt.Errorf("api_keys: id %q 重复（id 是稳定归因键，必须唯一）", id)
+		}
+		seenID[id] = true
+		// 重复密钥检测（阻断项 1）：与单值 api_key 或已见多 Key 重复 → fail fast。
+		if c.APIKey != "" && key == c.APIKey {
+			return fmt.Errorf("api_keys[%s]: key 与顶层 api_key 重复；同一密钥不能同时作为单值 Key 与受限多 Key（会绕过 models/realm 约束）", id)
+		}
+		if prevID, dup := seenKey[key]; dup {
+			return fmt.Errorf("api_keys: key 重复（id %q 与 %q 使用同一密钥）；同一密钥值只能出现一次，避免约束被另一把绕过", prevID, id)
+		}
+		seenKey[key] = id
+		if r := strings.ToLower(strings.TrimSpace(k.Realm)); r != "" && r != "cn" && r != "global" {
+			return fmt.Errorf("api_keys[%s]: realm %q 不是合法值（cn / global / 空）", id, k.Realm)
+		}
+		k.ID = id
+		k.Key = key
+		k.Realm = strings.ToLower(strings.TrimSpace(k.Realm))
+		filtered = append(filtered, k)
+	}
+	if len(filtered) == 0 {
+		return fmt.Errorf("api_keys: 没有有效条目（key 全为空）；要么提供至少一把有效 Key，要么删除该键")
+	}
+	c.APIKeys = filtered
+	return nil
+}
+
+// validKeyID 校验 id 白名单（R4）：[A-Za-z0-9_-] 且 ≤64。
+func validKeyID(id string) bool {
+	if len(id) == 0 || len(id) > 64 {
+		return false
+	}
+	for i := 0; i < len(id); i++ {
+		b := id[i]
+		if (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_' || b == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。
